@@ -1,0 +1,1208 @@
+import os
+import sys
+from pathlib import Path
+from dotenv import load_dotenv
+from google.auth.credentials import TokenState
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google import genai
+from google.genai import types, errors
+from google.genai.types import Part
+from sqlalchemy import (
+    UniqueConstraint,
+    Column,
+    BigInteger,
+    Integer,
+    String,
+    DateTime,
+    Float,
+    ForeignKey,
+    text,
+    select,
+)
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    async_sessionmaker,
+    AsyncSession,
+)
+from sqlalchemy.orm import relationship, declarative_base
+from datetime import datetime, timezone
+from pgvector.sqlalchemy import Vector
+from PIL import Image as PILImage
+import asyncio
+import logging
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from json import JSONDecodeError
+import json
+from typing import Optional, Dict, Any, Union
+
+load_dotenv()
+
+CLIENT_SECRETS_FILE = os.getenv("CLIENT_SECRETS_FILE", ".secrets/client_secret.json")
+TOKEN_DIR = os.getenv("TOKEN_DIR", ".secrets")
+TOKEN_FILE = Path(TOKEN_DIR) / "token.json"
+IMAGE_GALLERY = os.getenv("IMAGE_GALLERY", Path.home() / "pictures")
+SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+]
+REDIRECT_URI = os.getenv("REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
+PROJECT_ID = os.getenv("PROJECT_ID")
+LOCATION = os.getenv("LOCATION", "us-central1")
+DB_URL = os.getenv("DB_URL", "sqlite+pysqlite://data.db")
+VECTOR_DIMENSION = 768
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".gif"}
+EMBEDDING_MODEL = "text-embedding-004"
+AI_MODEL = "gemini-2.5-flash"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+TEMP_DIRECTORY = os.getenv("TEMP_DIRECTORY", "temp")
+NO_BROWSER = os.getenv("NO_BROWSER", False)
+SEMAPHORE_LIMIT = os.getenv("SEMAPHORE_LIMIT", 1)
+INDEX_TASK_DELAY = os.getenv("INDEX_TASK_DELAY", 3)
+CRED_TYPE = None
+AUTH_MODE = "API"
+
+os.makedirs("logs", exist_ok=True)
+
+now = datetime.now()
+log_file_name = f"app_{now.strftime('%Y-%m-%d_%H-%M-%S')}.log"
+log_file_path = Path("logs") / log_file_name
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M",
+    handlers=[logging.StreamHandler(), logging.FileHandler(log_file_path)],
+)
+
+
+def load_creds():
+    creds = None
+    token_path = Path(TOKEN_FILE)
+    if token_path.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        except ValueError as e:
+            logging.error(f"Credentials file unsupported: {e}")
+            sys.exit(0)
+        except Exception as e:
+            logging.error(f"Error occured: {e}")
+            sys.exit(0)
+    else:
+        logging.warning(f"Token file unavaliable at {token_path}")
+
+    if (
+        not creds
+        or not creds.valid
+        or getattr(creds, "token_state", None) == "INVALID"
+        or creds.token_state == TokenState.INVALID
+    ):
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES, redirect_uri=REDIRECT_URI)
+
+            if NO_BROWSER:
+                auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+                logging.info("Please visit this URL on another device:")
+                logging.info(auth_url)
+
+                code = input("Enter the authorization code here: ")
+                flow.fetch_token(code=code)
+                try:
+                    creds = flow.credentials
+                except ValueError as e:
+                    logging.error(f"Credential Token Value Error: {e}")
+                    sys.exit(0)
+                except Exception as e:
+                    logging.error(f"Credential Token Error: {e}")
+                    sys.exit(0)
+            else:
+                creds = flow.run_local_server(open_browser=True)
+
+        # Save token to file after successful auth or refresh
+        with open(token_path, "w") as token_file:
+            token_file.write(creds.to_json())
+
+    return creds
+
+
+def get_gemini_client():
+    creds = None
+
+    if AUTH_MODE == "OUTH":
+        if CLIENT_SECRETS_FILE:
+            try:
+                creds = load_creds()
+                client = genai.Client(credentials=creds, vertexai=True, location=LOCATION, project=PROJECT_ID)
+                logging.info(f"OAUTH Authentication was a success!")
+                CRED_TYPE = "OAUTH"
+                return client, CRED_TYPE
+            except Exception as e:
+                logging.error(f"OAuth Configuration failed: {e}")
+                sys.exit(0)
+
+    elif GOOGLE_API_KEY or AUTH_MODE == "API":
+        try:
+            client = genai.Client(api_key=str(GOOGLE_API_KEY))
+            logging.info("Client initialized using GOOGLE_API_KEY for Google AI SDK (supporting file upload).")
+            CRED_TYPE = "API"
+            return client, CRED_TYPE
+        except genai.errors.ClientError as e:
+            logging.error(f"--- [Client Error] get_gemini_client: {e}")
+            if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
+                logging.error(f"--- API Error Body: {e.response.text}")
+            sys.exit(0)
+        except errors.APIError as e:
+            logging.error(f"--- [API Error] {e.code}: {e.message}")
+            sys.exit(0)
+        except Exception as e:
+            logging.error(f"Error initializing Google AI Client with API Key: {e}")
+            sys.exit(0)
+
+
+client, CRED_TYPE = get_gemini_client()
+logging.info(f"Using this Auth Type: {CRED_TYPE}")
+
+# Define the declarative base for all models
+Base = declarative_base()
+
+# --- 0. New Table: Users ---
+
+
+class User(Base):
+    """
+    Table for storing user information.
+    """
+
+    __tablename__ = "users"
+
+    user_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    username = Column(String(50), nullable=False, unique=True)
+    email = Column(String(100), nullable=False, unique=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now())
+
+    # Relationships: This links back to all images uploaded by this user
+    images = relationship("Image", back_populates="user")
+
+    def __repr__(self):
+        return f"<User(id={self.user_id}, username='{self.username}')>"
+
+
+# --- 1. Core Table: Images ---
+
+
+class Image(Base):
+    """
+    Core table for image metadata.
+    """
+
+    __tablename__ = "images"
+
+    image_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    filename = Column(String(255), nullable=False, unique=True)
+    local_file_path = Column(String(512), nullable=False)
+    file_size_bytes = Column(Integer)
+    width_px = Column(Integer)
+    height_px = Column(Integer)
+    mime_type = Column(String(50))
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now())
+    capture_date = Column(DateTime)
+
+    ai_caption = Column(String(500))
+    # Foreign key link to the User who uploaded the image
+    user_id = Column(BigInteger, ForeignKey("users.user_id"))
+
+    # Relationships
+    tags = relationship("ImageTagXref", back_populates="image")
+    vector = relationship("FeatureVector", uselist=False, back_populates="image")
+    # Relationship to the User object (the 'owner' of this image)
+    user = relationship("User", back_populates="images")
+
+    def __repr__(self):
+        return f"<Image(id={self.image_id}, filename='{self.filename}')>"
+
+
+# --- 2. Tagging Table: Tags ---
+class Tag(Base):
+    """
+    Table defining descriptive tags/labels.
+    """
+
+    __tablename__ = "tags"
+
+    tag_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    tag_name = Column(String(100), nullable=False, unique=True)
+    tag_category = Column(String(50))
+
+    # Relationships
+    images = relationship("ImageTagXref", back_populates="tag")
+
+    def __repr__(self):
+        return f"<Tag(id={self.tag_id}, name='{self.tag_name}')>"
+
+
+# --- 3. Junction Table: ImageTagXref ---
+class ImageTagXref(Base):
+    """
+    Association table for the Many-to-Many relationship between Images and Tags.
+    """
+
+    __tablename__ = "image_tag_xref"
+
+    image_tag_id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Foreign Keys
+    image_id = Column(BigInteger, ForeignKey("images.image_id"), nullable=False)
+    tag_id = Column(BigInteger, ForeignKey("tags.tag_id"), nullable=False)
+
+    confidence = Column(Float)
+
+    # Relationships
+    image = relationship("Image", back_populates="tags")
+    tag = relationship("Tag", back_populates="images")
+
+    # Combined constraint to ensure an image is not linked to the same tag twice
+    __table_args__ = (UniqueConstraint("image_id", "tag_id", name="_image_tag_uc"),)
+
+    def __repr__(self):
+        return f"<ImageTagXref(image_id={self.image_id}, tag_id={self.tag_id}, confidence={self.confidence})>"
+
+
+# --- 4. Vector Table: FeatureVectors ---
+class FeatureVector(Base):
+    """
+    Stores the numerical vector embeddings for similarity search using pgvector.
+
+    NOTE: The Vector(3) dimension should be changed to match your model's
+    output dimension (e.g., Vector(512) or Vector(1024)).
+    """
+
+    __tablename__ = "feature_vectors"
+
+    # image_id is the primary key AND the foreign key (1:1 relationship)
+    image_id = Column(BigInteger, ForeignKey("images.image_id"), primary_key=True)
+
+    vector_embedding = Column(Vector(VECTOR_DIMENSION), nullable=False)
+
+    model_version = Column(String(50))
+
+    # Relationship (1:1)
+    image = relationship("Image", back_populates="vector")
+
+    def __repr__(self):
+        return f"<FeatureVector(image_id={self.image_id}, model='{self.model_version}')>"
+
+
+async def upload_file(image_path, mime_type: str):
+    logging.info(f"--- Calling SDK Upload: {image_path.name} (MIME: {mime_type})")
+    if CRED_TYPE == "API":
+        try:
+            file_resource = await client.aio.files.upload(file=image_path, config={"mime_type": mime_type})
+            upload_name = file_resource
+            logging.info(f"Image Successfully Uploaded: {upload_name}")
+
+            return file_resource
+        except Exception as e:
+            logging.error(f"--- SDK Upload Failed for {image_path.name}: {e}")
+            return None
+    elif CRED_TYPE == "OAUTH":
+        try:
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+            logging.info(f"Successfully read {len(image_bytes)} bytes from {image_path}")
+            file_resource = {"bytes": image_bytes, "file_name": image_path.name}
+            return file_resource
+        except IOError as e:
+            logging.critical(f"I/O error({e.errno}): {e.strerror}")
+            return None
+        except Exception as e:
+            logging.critical(f"Unable to read image and turn it into bytes: {e}")
+            return None
+    else:
+        logging.warning(f"Cred Type not found. Exiting... {CRED_TYPE}")
+        sys.exit(0)
+
+
+async def delete_file(file_name):
+    logging.info(f"--- Calling SDK Delete: {file_name}")
+    if CRED_TYPE == "API":
+        try:
+            await client.aio.files.delete(name=file_name)
+            logging.info(f"Deleted: {file_name}")
+        except Exception as e:
+            logging.error(f"--- SDK Upload Failed for {file_name}: {e}")
+            pass
+    elif CRED_TYPE == "OAUTH":
+        logging.info(f"Using {CRED_TYPE}, deletion not necessary.")
+    else:
+        logging.info(f"CRED_TYPE RETURNS: {CRED_TYPE} \n Which is not OAUTH or API.")
+        pass
+
+
+class ObjectDetection(BaseModel):
+    """Defines the structure for a single detected object."""
+
+    box_2d: list[int] = Field(description="Normalized coordinates [y0, x0, y1, x1] (0-1000).")
+    label: str = Field(description="A descriptive label for the object.")
+
+
+class ImageAnalysis(BaseModel):
+    """Defines the complete structured output from the Gemini analysis call."""
+
+    caption: str = Field(description="A short, concise description about the image.")
+    tags: list[str] = Field(description="A list of 3 keywords that describe the image.")
+    objects: list[ObjectDetection] = Field(
+        default_factory=list,
+        description="A list of objects detected in the image.",
+    )
+
+
+class PermanentAnalysisError(ValueError):
+    """
+    Custom exception for errors that should not be retried,
+    such as content blocks, empty responses, or parsing failures.
+    """
+
+    pass
+
+
+async def get_gemini_analysis_and_vector(
+    file_resource: types.File,
+    uploaded_mime_type: str,
+    is_sprite_sheet: bool = False,
+):
+
+    file_name_for_logging = file_resource["file_name"] if isinstance(file_resource, dict) else file_resource.name
+    logging.info(f"--- Calling SDK GenerateContent for file: {file_name_for_logging}")
+
+    caption = None
+    tags = []
+    vector_embedding = None
+    response = None
+
+    try:
+        if is_sprite_sheet:
+            prompt_text = "Analyze this image, which is a sprite sheet of 5 frames from a GIF "
+            "laid out horizontally from left to right. Describe the full action or "
+            "animation from start to finish, then provide the requested structured data."
+        else:
+            prompt_text = "Analyze the image and provide the requested structured data."
+
+        if CRED_TYPE == "API":
+            contents = [Part.from_text(text=prompt_text), file_resource]
+        elif isinstance(file_resource, dict):
+            contents = [
+                Part.from_text(text=prompt_text),
+                Part.from_bytes(data=file_resource["bytes"], mime_type=uploaded_mime_type),
+            ]
+        else:
+            logging.critical(f"Invalid file_resource type: {type(file_resource)}. Exiting...")
+            sys.exit(0)
+
+        image_analysis_json_schema = {
+            "type": "object",
+            "properties": {
+                "caption": {
+                    "type": "string",
+                    "description": "A short, concise description about the image.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "A list of 3 keywords that describe the image.",
+                },
+                "objects": {
+                    "type": "array",
+                    "description": "A list of objects detected in the image.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "box_2d": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "Normalized coordinates [y0, x0, y1, x1] (0-1000).",
+                            },
+                            "label": {
+                                "type": "string",
+                                "description": "A descriptive label for the object.",
+                            },
+                        },
+                        "required": ["box_2d", "label"],
+                    },
+                },
+            },
+            "required": ["caption", "tags"],
+        }
+
+        safety_settings = [
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+        ]
+
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=image_analysis_json_schema,
+            thinking_config=types.ThinkingConfig(include_thoughts=False),
+            should_return_http_response=True,
+            safety_settings=safety_settings,
+        )
+
+        response = await client.aio.models.generate_content(model=AI_MODEL, contents=contents, config=config)
+
+        if not response or not response.text:
+            logging.error("Empty response.text from Gemini")
+            # This is a permanent failure, do not retry
+            raise PermanentAnalysisError("Gemini AI model returned empty response.text")
+
+        try:
+            resp_json = json.loads(response.text)
+
+            # Defensive check for blocking or empty content returned by model
+            if "promptFeedback" in resp_json and resp_json["promptFeedback"].get("blockReason"):
+                block_reason = resp_json["promptFeedback"]["blockReason"]
+                logging.error(f"Model blocked request with reason: {block_reason}")
+                raise PermanentAnalysisError(f"Gemini AI model blocked request: {block_reason}")
+
+            # Defensive check: ensure expected keys exist to avoid parse errors
+            if not resp_json.get("caption") or not resp_json.get("tags"):
+                logging.error("Response missing required keys 'caption' or 'tags'. Treating as empty.")
+                raise PermanentAnalysisError("Gemini AI model returned incomplete response")
+
+            # Parse analysis object from JSON using Pydantic
+            analysis_object = ImageAnalysis.model_validate_json(response.text)
+            caption = analysis_object.caption
+            tags = analysis_object.tags
+
+        except (ValidationError, JSONDecodeError) as e:
+            logging.error(f"Failed to parse model's JSON response: {e}")
+            if response and hasattr(response, "text"):
+                logging.error(f"Raw Model Response: {response.text}")
+            # This is also a permanent failure
+            raise PermanentAnalysisError(f"Failed to parse model's JSON response: {e}")
+        # --- End of parsing block ---
+
+        logging.info(f"--- Analysis Success: {caption[:30].strip()}...")
+
+    except genai.errors.ClientError as e:
+        logging.error(f"--- [Client Error]: SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
+        if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
+            logging.error(f"--- API Error Body: {e.response.text}")
+        raise  # Re-raise transient ClientErrors to be caught by the retry wrapper
+
+    except Exception as e:
+        # Catch our own PermanentAnalysisError and other unexpected errors
+        if not isinstance(e, PermanentAnalysisError):
+            logging.error(f"--- SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
+        raise  # Re-raise all errors
+
+    # Generate embeddings for the caption (if analysis succeeded)
+    try:
+        logging.info("Generating Embeddings...")
+        vector_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL, contents=[caption])
+        if vector_response.embeddings:
+            vector_embedding = vector_response.embedding.values
+            logging.info(f"--- Embedding Success")
+        else:
+            raise PermanentAnalysisError("EmbedContentResponse returned no embeddings.")
+
+        return caption, tags, vector_embedding
+
+    except Exception as e:
+        if not isinstance(e, PermanentAnalysisError):
+            logging.error(f"--- SDK Embedding FAILED: {e}")
+        raise  # Re-raise all errors
+
+
+async def get_gemini_analysis_and_vector_with_retries(
+    file_resource: types.File,
+    uploaded_mime_type: str,
+    is_sprite_sheet: bool = False,
+    max_retries: int = 3,
+    backoff_factor: float = 1.5,
+):
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            return await get_gemini_analysis_and_vector(file_resource, uploaded_mime_type, is_sprite_sheet)
+
+        # --- MODIFICATION 3 (Smarter exception handling) ---
+        except Exception as e:
+            # Check if this is a permanent failure that should NOT be retried
+            if isinstance(e, PermanentAnalysisError):
+                if CRED_TYPE == "API":
+                    logging.error(f"Permanent failure for {file_resource.name}: {e}. No retries will be attempted.")
+                else:
+                    logging.error(f"Permanent failure for Inline Image: {e}. No retries will be attempted.")
+                raise e  # Re-raise the permanent error to stop the loop
+
+            # Handle transient errors (e.g., ClientError, network issues)
+            logging.warning(f"Attempt {attempt + 1} failed with transient error: {e}. Retrying...")
+
+        attempt += 1
+
+        # Only sleep if we are not on the last attempt
+        if attempt < max_retries:
+            sleep_time = backoff_factor**attempt
+            logging.info(f"Sleeping {sleep_time:.2f} seconds before retry...")
+            await asyncio.sleep(sleep_time)
+
+    # If the loop finishes, it means all retries failed
+    if CRED_TYPE == "API":
+        raise RuntimeError(f"Failed to get valid Gemini analysis for {file_resource.name} after {max_retries} attempts")
+    else:
+        raise RuntimeError(f"Failed to get valid Gemini analysis for Inline Image after {max_retries} attempts")
+
+
+def sync_convert_gif_to_sprite_sheet(gif_path, temp_path, num_frames=5):
+    """
+    Extracts frames from a GIF using Pillow, stitches them into a
+    horizontal sprite sheet, and saves as a PNG.
+    """
+    with PILImage.open(gif_path) as img:
+        total_frames = img.n_frames
+
+        num_to_sample = min(num_frames, total_frames)
+        if num_to_sample <= 0:
+            logging.error(f"GIF has no frames: {gif_path.name}")
+            return None
+
+        # Pick evenly spaced frame indices
+        if num_to_sample == 1:
+            indices = [0]
+        else:
+            indices = [int(i * (total_frames - 1) / (num_to_sample - 1)) for i in range(num_to_sample)]
+        indices = sorted(list(set(indices)))  # Remove duplicates
+        num_to_sample = len(indices)
+
+        frames = []
+        for i in indices:
+            img.seek(i)
+            # Copy and convert to RGBA for clean pasting
+            frames.append(img.copy().convert("RGBA"))
+
+        if not frames:
+            logging.error(f"Could not extract frames: {gif_path.name}")
+            return None
+
+        # Create the new sprite sheet image
+        frame_width = frames[0].width
+        frame_height = frames[0].height
+        total_width = frame_width * num_to_sample
+
+        sprite_sheet = PILImage.new("RGBA", (total_width, frame_height))
+
+        # Paste each frame side-by-side
+        for i, frame in enumerate(frames):
+            sprite_sheet.paste(frame, (i * frame_width, 0))
+
+        # Save the final PNG
+        sprite_sheet.save(temp_path, format="PNG")
+        logging.info(f"Saved {num_to_sample}-frame sprite sheet: {temp_path.name}")
+        return temp_path
+
+
+async def convert_gif_to_sprite_sheet(gif_path, temp_path, num_frames=5):
+    """
+    Async wrapper to run the sync GIF conversion in a separate thread.
+    """
+    try:
+        # Run the blocking PIL code in a thread to avoid blocking asyncio
+        return await asyncio.to_thread(sync_convert_gif_to_sprite_sheet, gif_path, temp_path, num_frames)
+    except Exception as e:
+        logging.error(f"Failed to convert GIF {gif_path.name}: {e}")
+        return None
+
+
+async def get_gemini_analysis_and_vector(
+    file_resource: Union[types.File, dict],
+    uploaded_mime_type: str,
+    is_sprite_sheet: bool = False,
+):
+
+    file_name_for_logging = file_resource["file_name"] if isinstance(file_resource, dict) else file_resource.name
+    logging.info(f"--- Calling SDK GenerateContent for file: {file_name_for_logging}")
+
+    caption = None
+    tags = []
+    vector_embedding = None
+    response = None
+
+    try:
+        if is_sprite_sheet:
+            prompt_text = "Analyze this image, which is a sprite sheet of 5 frames from a GIF "
+            "laid out horizontally from left to right. Describe the full action or "
+            "animation from start to finish, then provide the requested structured data."
+        else:
+            prompt_text = "Analyze the image and provide the requested structured data."
+
+        if CRED_TYPE == "API":
+            contents = [Part.from_text(text=prompt_text), file_resource]
+        elif isinstance(file_resource, dict):
+            # This is the OAUTH case
+            contents = [
+                Part.from_text(text=prompt_text),
+                Part.from_bytes(data=file_resource["bytes"], mime_type=uploaded_mime_type),
+            ]
+            # *** FIX: Removed 'return contents' bug and unnecessary try/except ***
+        else:
+            logging.critical(f"Invalid file_resource type: {type(file_resource)}. Exiting...")
+            sys.exit(0)
+
+        image_analysis_json_schema = {
+            "type": "object",
+            "properties": {
+                "caption": {
+                    "type": "string",
+                    "description": "A short, concise description about the image.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "A list of 3 keywords that describe the image.",
+                },
+                "objects": {
+                    "type": "array",
+                    "description": "A list of objects detected in the image.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "box_2d": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "Normalized coordinates [y0, x0, y1, x1] (0-1000).",
+                            },
+                            "label": {
+                                "type": "string",
+                                "description": "A descriptive label for the object.",
+                            },
+                        },
+                        "required": ["box_2d", "label"],
+                    },
+                },
+            },
+            "required": ["caption", "tags"],
+        }
+
+        safety_settings = [
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            # *** FIX: Removed invalid 'HARM_CATEGORY_CIVIC_INTEGRITY' ***
+        ]
+
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=image_analysis_json_schema,
+            thinking_config=types.ThinkingConfig(include_thoughts=False),
+            should_return_http_response=True,
+            safety_settings=safety_settings,
+        )
+
+        response = await client.aio.models.generate_content(model=AI_MODEL, contents=contents, config=config)
+
+        # --- *** FIX: Added robust JSON parsing and validation *** ---
+        if not response or not response.text:
+            logging.error("Empty response.text from Gemini")
+            # This is a permanent failure, do not retry
+            raise PermanentAnalysisError("Gemini AI model returned empty response.text")
+
+        try:
+            resp_json = json.loads(response.text)
+
+            # Defensive check for blocking or empty content returned by model
+            if "promptFeedback" in resp_json and resp_json["promptFeedback"].get("blockReason"):
+                block_reason = resp_json["promptFeedback"]["blockReason"]
+                logging.error(f"Model blocked request with reason: {block_reason}")
+                raise PermanentAnalysisError(f"Gemini AI model blocked request: {block_reason}")
+
+            # Defensive check: ensure expected keys exist to avoid parse errors
+            if not resp_json.get("caption") or not resp_json.get("tags"):
+                logging.error("Response missing required keys 'caption' or 'tags'. Treating as empty.")
+                raise PermanentAnalysisError("Gemini AI model returned incomplete response")
+
+            # Parse analysis object from JSON using Pydantic
+            analysis_object = ImageAnalysis.model_validate_json(response.text)
+            caption = analysis_object.caption
+            tags = analysis_object.tags
+
+        except (ValidationError, JSONDecodeError) as e:
+            logging.error(f"Failed to parse model's JSON response: {e}")
+            if response and hasattr(response, "text"):
+                logging.error(f"Raw Model Response: {response.text}")
+            # This is also a permanent failure
+            raise PermanentAnalysisError(f"Failed to parse model's JSON response: {e}")
+        # --- End of parsing block ---
+
+        logging.info(f"--- Analysis Success: {caption[:30].strip()}...")
+
+    except genai.errors.ClientError as e:
+        logging.error(f"--- [Client Error]: SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
+        if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
+            logging.error(f"--- API Error Body: {e.response.text}")
+        raise  # Re-raise transient ClientErrors to be caught by the retry wrapper
+
+    except Exception as e:
+        # Catch our own PermanentAnalysisError and other unexpected errors
+        if not isinstance(e, PermanentAnalysisError):
+            logging.error(f"--- SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
+        raise  # Re-raise all errors
+
+    # Generate embeddings for the caption (if analysis succeeded)
+    try:
+        logging.info("Generating Embeddings...")
+        vector_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL, contents=[caption])
+        if vector_response.embeddings:
+            vector_embedding = vector_response.embedding.values
+            logging.info(f"--- Embedding Success")
+        else:
+            raise PermanentAnalysisError("EmbedContentResponse returned no embeddings.")
+
+        return caption, tags, vector_embedding
+
+    except Exception as e:
+        if not isinstance(e, PermanentAnalysisError):
+            logging.error(f"--- SDK Embedding FAILED: {e}")
+        raise  # Re-raise all errors
+
+
+async def index_image(session: AsyncSession, image_path, user_id):
+    await asyncio.sleep(0.05)
+    logging.info(f"\n[Indexing] Starting image: {image_path.name}")
+
+    # --- CHECK IF IMAGE ALREADY EXISTS ---
+    existing = await session.execute(select(Image).filter_by(filename=image_path.name))
+    if existing.scalar_one_or_none():
+        logging.info(f"[Indexing] SKIPPED: {image_path.name} (already indexed)")
+        return
+
+    file_resource = None  # Can be types.File or dict
+    temp_image_path = None
+    path_to_upload = image_path
+    is_sprite_sheet = False
+    original_ext = image_path.suffix.lower()  # <-- Has dot: ".jpg"
+    orig_mime = ""  # <-- Store original mime type
+
+    try:
+        # --- 1. NORMALIZE FILE AND MIME TYPE ---
+        # *** FIX: Check with dot ***
+        if original_ext == ".jpg":
+            mime_type = "image/jpeg"
+            orig_mime = "image/jpeg"
+
+        elif original_ext == ".gif":
+            logging.info(f"Converting GIF: {image_path.name}")
+            temp_file_name = image_path.with_suffix(".sprite_sheet.png").name
+
+            temp_image_path = Path(TEMP_DIRECTORY) / temp_file_name
+            path_to_upload = await convert_gif_to_sprite_sheet(image_path, temp_image_path, num_frames=5)
+
+            if not path_to_upload:
+                logging.error(f"[Indexing] Skipping {image_path.name}, GIF conversion failed.")
+                return
+
+            mime_type = "image/png"  # Upload is PNG
+            orig_mime = "image/gif"  # Original is GIF
+            is_sprite_sheet = True
+
+        elif original_ext in IMAGE_EXTENSIONS:
+            # *** FIX: Remove dot for mime type ***
+            mime_type = f"image/{original_ext.lstrip('.')}"
+            orig_mime = mime_type
+
+        else:
+            logging.warning(f"[Indexing] Unknown extension '{original_ext}', skipping file {image_path.name}")
+            return
+
+        # file_resource is now the full File object or a dict
+        file_resource = await upload_file(path_to_upload, mime_type)
+        if not file_resource:
+            logging.error(f"[Indexing] Skipping {image_path.name} due to upload failure")
+            return
+
+        # *** FIX: Correct logic for handling dict (OAuth) vs File (API) ***
+        if isinstance(file_resource, dict):
+            # OAUTH case: file_resource is {'bytes': ..., 'file_name': ...}
+            caption, ai_tags, vector_embedding = await get_gemini_analysis_and_vector_with_retries(
+                file_resource, mime_type, is_sprite_sheet
+            )
+        else:
+            # API case: file_resource is types.File object
+            caption, ai_tags, vector_embedding = await get_gemini_analysis_and_vector_with_retries(
+                file_resource, mime_type, is_sprite_sheet
+            )
+        # *** End of fix ***
+
+        width, height = 0, 0
+        try:
+            with PILImage.open(image_path) as img:
+                width, height = img.size
+            logging.info(f"[Indexing] Dimensions read: {width}x{height}")
+        except Exception as e:
+            logging.error(f"[Indexing] Warning: Could not read dimensions for {image_path.name}. Error: {e}")
+
+        new_image = Image(
+            filename=image_path.name,
+            local_file_path=str(image_path.resolve()),
+            file_size_bytes=image_path.stat().st_size,
+            width_px=width,
+            height_px=height,
+            mime_type=orig_mime,  # Use the original file's mime type
+            user_id=user_id,
+            ai_caption=caption,
+        )
+        session.add(new_image)
+        await session.flush()  # Flush to get new_image.image_id
+
+        new_vector = FeatureVector(
+            image=new_image,
+            model_version=EMBEDDING_MODEL,
+            vector_embedding=vector_embedding,
+        )
+        session.add(new_vector)
+
+        # Truncate tag name to fit column
+        tag_name = caption[:97] + "..." if len(caption) > 100 else caption
+
+        tag_result = await session.execute(select(Tag).filter_by(tag_name=tag_name))
+        caption_tag = tag_result.scalar_one_or_none()
+
+        if not caption_tag:
+            caption_tag = Tag(tag_name=tag_name, tag_category="AI_Caption")
+            session.add(caption_tag)
+            await session.flush()
+
+        caption_xref = ImageTagXref(image=new_image, tag=caption_tag, confidence=1.0)
+        session.add(caption_xref)
+
+        for tag_name_raw in ai_tags:
+            tag_name = tag_name_raw[:99]  # Truncate to 100 char limit
+
+            tag_result = await session.execute(select(Tag).filter_by(tag_name=tag_name))
+            keyword_tag = tag_result.scalar_one_or_none()
+
+            if not keyword_tag:
+                keyword_tag = Tag(tag_name=tag_name, tag_category="AI_Keyword")
+                session.add(keyword_tag)
+                await session.flush()
+
+            keyword_xref = ImageTagXref(image=new_image, tag=keyword_tag, confidence=0.9)
+            session.add(keyword_xref)
+
+        logging.info(f"[Indexing] SUCCESS: {image_path.name} prepped for commit.")
+
+    except PermanentAnalysisError as e:
+        # This was already logged, just note that we are skipping this file
+        logging.error(f"[Indexing] SKIPPED (Permanent Error): {image_path.name}. Error: {e}")
+        # Do not re-raise, allow the process to continue with other images
+
+    except genai.errors.ClientError as e:
+        logging.error(f"--- [Client Error] index_image: {e}")
+        if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
+            logging.error(f"--- API Error Body: {e.response.text}")
+    except errors.APIError as e:
+        logging.error(f"--- [Indexing Error] {e.code}: {e.message}")
+
+    except Exception as e:
+        logging.error(f"[Indexing] An error occurred while indexing {image_path.name}: {e}")
+        raise  # Re-raise to trigger rollback in controlled_index_task
+
+    finally:
+        # *** FIX: Only delete if file_resource is a types.File (API case) ***
+        if file_resource and not isinstance(file_resource, dict):
+            await delete_file(file_resource.name)
+        elif file_resource and isinstance(file_resource, dict):
+            logging.info(f"OAUTH upload, no cloud file to delete for {file_resource.get('file_name')}.")
+
+        if temp_image_path is not None:
+            try:
+                if isinstance(temp_image_path, Path) and temp_image_path.exists():
+                    temp_image_path.unlink()
+                    logging.info(f"Cleaned up temp file: {temp_image_path.name}")
+            except OSError as e:
+                logging.error(f"Failed to clean up temp file: {e}")
+
+
+async def run_indexing_async(Session: async_sessionmaker, user_id, gallery_dir, image_paths_to_index):
+
+    # This semaphore belongs to the outer function
+    sem = asyncio.Semaphore(int(SEMAPHORE_LIMIT))
+
+    # --- DEFINE THE TASK FUNCTION *INSIDE* ---
+    # This lets it access 'sem' and 'Session'
+    async def controlled_index_task(path, user_id):
+        async with Session() as session:
+            async with sem:
+                try:
+                    await index_image(session, path, user_id)
+                    await session.commit()
+                except Exception as e:
+                    # This message is now correct
+                    logging.error(f"[Indexing] FAILED/ROLLED BACK: {path.name}. Error: {e}")
+                    await session.rollback()
+                finally:
+                    # --- ADD THIS DELAY ---
+                    # Force a wait to stay under the RPM limit
+                    logging.info(f"[Concurrency] Waiting {INDEX_TASK_DELAY}s to respect rate limit...")
+                    # Convert to int in case it's read from .env as str
+                    await asyncio.sleep(int(INDEX_TASK_DELAY))
+
+    # --- THIS BLOCK RUNS THE TASKS ---
+    # It must be indented inside run_indexing_async, NOT controlled_index_task
+    try:
+        logging.info(f"[Concurrency] Limiting concurrent indexing tasks to {SEMAPHORE_LIMIT}.")
+        tasks = [controlled_index_task(path, user_id) for path in image_paths_to_index]
+
+        await asyncio.gather(*tasks)
+        logging.info("\n[Indexing] All concurrent tasks completed")
+    except Exception as e:
+        logging.error(f"\n[Indexing] FATAL ERROR during concurrent run: {e}")
+
+
+async def embed_text_query(query, task_type: str = "SEMANTIC_SIMILARITY"):
+    logging.info(f"\n[Embed Utility] Generating vector for text query: '{query[:30]}...' (Type: {task_type})")
+
+    try:
+        vector_response = await client.aio.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=[query],
+            config=types.EmbedContentConfig(task_type=task_type),
+        )
+
+        query_vector = vector_response.embedding.values
+
+        logging.info(f"[Embed Utility] Query vector generated (Dim: {len(query_vector)}).")
+        return query_vector
+
+    except genai.errors.ClientError as e:
+        logging.error(f"--- [Client Error] get_gemini_client: {e}")
+
+        if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
+            logging.error(f"--- API Error Body: {e.response.text}")
+
+    except errors.APIError as e:
+        logging.error(f"--- [Embedding Error] {e.code}: {e.message}")
+
+    except Exception as e:
+        logging.error(f"[Embed Utility] ERROR: Could not generate embedding for query: {e}")
+        return None
+
+
+async def find_similar_images(Session: async_sessionmaker, query, limit: int = 5):
+    query_vector = await embed_text_query(query, task_type="RETRIEVAL_QUERY")
+    if not query_vector:
+        return []
+
+    results = []
+    # --- Use async session ---
+    async with Session() as session:
+        try:
+            # Define the distance operation
+            if isinstance(query_vector, list):
+                query_vector = tuple(query_vector)
+            distance = FeatureVector.vector_embedding.op("<->")(query_vector).label("distance")
+
+            # --- Use SQLAlchemy 2.0 select() style ---
+            query_stmt = (
+                select(Image, distance)
+                .join(FeatureVector, Image.image_id == FeatureVector.image_id)
+                # pgvector sorts ASC by default (closest first)
+                .order_by(distance)
+                .limit(limit)
+            )
+
+            logging.info("[Search] Executing vector similarity query...")
+
+            # Execute the query
+            query_result = await session.execute(query_stmt)
+            raw_results = query_result.all()  # .all() is sync, gets results from cursor
+
+            for image, dist_val in raw_results:
+                results.append(
+                    {
+                        "image_id": image.image_id,
+                        "filename": image.filename,
+                        "ai_caption": image.ai_caption,
+                        "local_file_path": image.local_file_path,
+                        "similarity_distance": dist_val,
+                    }
+                )
+        except genai.errors.ClientError as e:
+            logging.error(f"--- [Client Error] get_gemini_client: {e}")
+            if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
+                logging.error(f"--- API Error Body: {e.response.text}")
+        except errors.APIError as e:
+            logging.error(f"--- [Vector Error] {e.code}: {e.message}")
+        except Exception as e:
+            logging.error(f"[Search] FATAL ERROR during vector query: {e}")
+            # No rollback needed on SELECT, session closes automatically
+
+    return results
+
+
+async def initialize_database(db_url):
+    if not db_url.startswith("postgresql+asyncpg"):
+        logging.warning(f"Database URL does not look like an asyncpg URL: {db_url}")
+        if db_url.startswith("sqlite"):
+            logging.error("SQLite cannot be used with this async script. Please use PostgreSQL.")
+            sys.exit(1)
+
+    logging.info(f"Connecting to database at {db_url.split('@')[-1]}")
+
+    engine = create_async_engine(
+        db_url,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=0,
+        connect_args={"ssl": True},
+    )
+
+    try:
+        # --- Use async connection to run setup ---
+        async with engine.begin() as conn:
+            logging.info("Enabling pgvector extension if not already present...")
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+
+            logging.info("Creating tables if they do not exist...")
+            await conn.run_sync(Base.metadata.create_all)
+
+    except Exception as e:
+        logging.error(f"FATAL: Could not connect or enable 'vector' extension. Error: {e}")
+        sys.exit(1)
+
+    logging.info("Database initialization complete.")
+
+    # --- Create async sessionmaker ---
+    Session = async_sessionmaker(
+        bind=engine,
+        expire_on_commit=False,  # Important for accessing objects after commit
+        class_=AsyncSession,
+    )
+    return engine, Session
+
+
+async def main():
+    """Main asynchronous function to run the script."""
+    os.makedirs(Path(TEMP_DIRECTORY), exist_ok=True)
+
+    engine, Session = await initialize_database(DB_URL)
+
+    gallery_dir = Path(IMAGE_GALLERY)
+    if not gallery_dir.is_dir():
+        logging.error(f"\n[ERROR] The directory '{gallery_dir}' does not exist.")
+        sys.exit(1)
+
+    logging.info(f"\n[Setup] Scanning image directory: {gallery_dir}")
+
+    image_paths_to_index = []
+    for p in gallery_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
+            image_paths_to_index.append(p)
+        elif p.is_file():
+            logging.info(f"[Scanning] SKIPPED: {p.name} (Not an image file)")
+
+    if not image_paths_to_index:
+        logging.warning("[Setup] No images found to index in the gallery directory.")
+        # We can continue, to allow searching existing images
+
+    mock_user = None
+    # --- Async setup for mock user ---
+    async with Session() as setup_session:
+        try:
+            user_result = await setup_session.execute(select(User).filter_by(username="image_indexer_bot"))
+            mock_user = user_result.scalar_one_or_none()
+
+            if not mock_user:
+                logging.info("Creating mock user 'image_indexer_bot'...")
+                mock_user = User(username="image_indexer_bot", email="indexer@example.com")
+                setup_session.add(mock_user)
+                await setup_session.commit()
+                logging.info(f"Mock user created with ID: {mock_user.user_id}")
+            else:
+                logging.info(f"Found existing mock user with ID: {mock_user.user_id}")
+        except Exception as e:
+            logging.error(f"Failed to create or find mock user: {e}")
+            await setup_session.rollback()
+            sys.exit(1)
+
+    if image_paths_to_index:
+        try:
+            logging.info(f"\n[Indexing] Starting to index {len(image_paths_to_index)} images...")
+            await run_indexing_async(Session, mock_user.user_id, gallery_dir, image_paths_to_index)
+        except KeyboardInterrupt:
+            logging.info("\n Indexing interrupted by user.")
+    else:
+        logging.info("\n[Indexing] Skipping indexing as no new images were found.")
+
+    logging.info("\n" + "=" * 50)
+    logging.info("PERFORMING SEMANTIC SEARCH TEST")
+    print("=" * 50)
+
+    search_query = "Anything Dog related"
+
+    search_results = await find_similar_images(Session, search_query, limit=3)
+
+    if search_results:
+        print(f"\n[Search Results for '{search_query}']")
+        for result in search_results:
+            print(f"  - File: {result['filename']} (ID: {result['image_id']})")
+            print(f"    - Caption: {result['ai_caption']}")
+            print(f"    - Local Path: {result['local_file_path']}")
+            print(f"    - Distance (L2): {result['similarity_distance']:.4f}")
+    else:
+        print("\nNo search results found.")
+
+    # Test caching
+    logging.info("\n" + "=" * 50)
+    logging.info("PERFORMING SECOND SEARCH (TESTING CACHE)")
+    print("=" * 50)
+
+    search_results_cached = await find_similar_images(Session, search_query, limit=3)
+    if search_results_cached:
+        print(f"\n[Cached Search Results for '{search_query}']")
+        print("(This should have been faster and not logged a 'Fallback' message in embed_text_query)")
+    else:
+        print("\nNo search results found.")
+
+    # Clean up engine resources
+    await engine.dispose()
+
+
+if __name__ == "__main__":
+    # --- Run the main async function ---
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("\nScript terminated by user.")
+        sys.exit(0)
