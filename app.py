@@ -20,6 +20,7 @@ from sqlalchemy import (
     ForeignKey,
     text,
     select,
+    or_,
 )
 from sqlalchemy.ext.asyncio import (
     create_async_engine,
@@ -27,15 +28,16 @@ from sqlalchemy.ext.asyncio import (
     AsyncSession,
 )
 from sqlalchemy.orm import relationship, declarative_base
-from datetime import datetime, timezone
+from datetime import datetime
 from pgvector.sqlalchemy import Vector
 from PIL import Image as PILImage
 import asyncio
 import logging
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from json import JSONDecodeError
 import json
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Union
+import colorlog
 
 load_dotenv()
 
@@ -60,10 +62,11 @@ AI_MODEL = "gemini-2.5-flash"
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TEMP_DIRECTORY = os.getenv("TEMP_DIRECTORY", "temp")
 NO_BROWSER = os.getenv("NO_BROWSER", False)
-SEMAPHORE_LIMIT = os.getenv("SEMAPHORE_LIMIT", 1)
+SEMAPHORE_LIMIT = os.getenv("SEMAPHORE_LIMIT", 3)
 INDEX_TASK_DELAY = os.getenv("INDEX_TASK_DELAY", 3)
 CRED_TYPE = None
-AUTH_MODE = "API"
+AUTH_MODE = "OAUTH"
+NO_RETRY_DELAY = os.getenv("NO_RETRY_DELAY", 0)
 
 os.makedirs("logs", exist_ok=True)
 
@@ -71,12 +74,38 @@ now = datetime.now()
 log_file_name = f"app_{now.strftime('%Y-%m-%d_%H-%M-%S')}.log"
 log_file_path = Path("logs") / log_file_name
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+# Get the root logger
+logger = colorlog.getLogger()
+logger.setLevel(logging.INFO)
+
+# Create a colorized formatter
+formatter = colorlog.ColoredFormatter(
+    "%(log_color)s%(asctime)s - %(levelname)s%(reset)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M",
-    handlers=[logging.StreamHandler(), logging.FileHandler(log_file_path)],
+    reset=True,
+    log_colors={
+        "DEBUG": "cyan",
+        "INFO": "green",
+        "WARNING": "yellow",
+        "ERROR": "red",
+        "CRITICAL": "red,bg_white",
+    },
+    secondary_log_colors={},
+    style="%",
 )
+
+# Create a handler for stream output and set the formatter
+stream_handler = colorlog.StreamHandler()
+stream_handler.setFormatter(formatter)
+
+# Create a handler for file output
+file_handler = logging.FileHandler(log_file_path)
+file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M")
+file_handler.setFormatter(file_formatter)
+
+# Add handlers to the logger
+logger.addHandler(stream_handler)
+logger.addHandler(file_handler)
 
 
 def load_creds():
@@ -138,7 +167,7 @@ def get_gemini_client():
             try:
                 creds = load_creds()
                 client = genai.Client(credentials=creds, vertexai=True, location=LOCATION, project=PROJECT_ID)
-                logging.info(f"OAUTH Authentication was a success!")
+                logging.info("OAUTH Authentication was a success!")
                 CRED_TYPE = "OAUTH"
                 return client, CRED_TYPE
             except Exception as e:
@@ -152,12 +181,12 @@ def get_gemini_client():
             CRED_TYPE = "API"
             return client, CRED_TYPE
         except genai.errors.ClientError as e:
-            logging.error(f"--- [Client Error] get_gemini_client: {e}")
+            logging.error(f"[Client Error] get_gemini_client: {e}")
             if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
-                logging.error(f"--- API Error Body: {e.response.text}")
+                logging.error(f"API Error Body: {e.response.text}")
             sys.exit(0)
         except errors.APIError as e:
-            logging.error(f"--- [API Error] {e.code}: {e.message}")
+            logging.error(f"[API Error] {e.code}: {e.message}")
             sys.exit(0)
         except Exception as e:
             logging.error(f"Error initializing Google AI Client with API Key: {e}")
@@ -170,7 +199,27 @@ logging.info(f"Using this Auth Type: {CRED_TYPE}")
 # Define the declarative base for all models
 Base = declarative_base()
 
-# --- 0. New Table: Users ---
+# class GeminiModelManager:
+
+
+async def get_available_models():
+    """Gets a sorted list of available models that support content generation."""
+    supported_models = []
+    try:
+        model_list = await client.aio.models.list()
+        for model in model_list:
+            if "generateContent" in model.supported_actions and "createCachedContent" in model.supported_actions:
+                model_name = model.name.replace("models/", "")
+                if model_name not in supported_models:
+                    supported_models.append(model_name)
+    except Exception as e:
+        logging.error(f"Could not retrieve model list: {e}")
+    supported_models.sort(reverse=True)
+    # logging.info(f"Avaliable models: {supported_models}")
+    return supported_models
+
+
+# 0. New Table: Users ---
 
 
 class User(Base):
@@ -192,7 +241,7 @@ class User(Base):
         return f"<User(id={self.user_id}, username='{self.username}')>"
 
 
-# --- 1. Core Table: Images ---
+# 1. Core Table: Images ---
 
 
 class Image(Base):
@@ -217,8 +266,8 @@ class Image(Base):
     user_id = Column(BigInteger, ForeignKey("users.user_id"))
 
     # Relationships
-    tags = relationship("ImageTagXref", back_populates="image")
-    vector = relationship("FeatureVector", uselist=False, back_populates="image")
+    tags = relationship("ImageTagXref", back_populates="image", cascade="all, delete-orphan")
+    vector = relationship("FeatureVector", uselist=False, back_populates="image", cascade="all, delete-orphan")
     # Relationship to the User object (the 'owner' of this image)
     user = relationship("User", back_populates="images")
 
@@ -226,7 +275,7 @@ class Image(Base):
         return f"<Image(id={self.image_id}, filename='{self.filename}')>"
 
 
-# --- 2. Tagging Table: Tags ---
+# 2. Tagging Table: Tags ---
 class Tag(Base):
     """
     Table defining descriptive tags/labels.
@@ -245,7 +294,7 @@ class Tag(Base):
         return f"<Tag(id={self.tag_id}, name='{self.tag_name}')>"
 
 
-# --- 3. Junction Table: ImageTagXref ---
+# 3. Junction Table: ImageTagXref ---
 class ImageTagXref(Base):
     """
     Association table for the Many-to-Many relationship between Images and Tags.
@@ -272,7 +321,7 @@ class ImageTagXref(Base):
         return f"<ImageTagXref(image_id={self.image_id}, tag_id={self.tag_id}, confidence={self.confidence})>"
 
 
-# --- 4. Vector Table: FeatureVectors ---
+# 4. Vector Table: FeatureVectors ---
 class FeatureVector(Base):
     """
     Stores the numerical vector embeddings for similarity search using pgvector.
@@ -298,16 +347,16 @@ class FeatureVector(Base):
 
 
 async def upload_file(image_path, mime_type: str):
-    logging.info(f"--- Calling SDK Upload: {image_path.name} (MIME: {mime_type})")
+    logging.info(f"Calling SDK Upload: {image_path.name} (MIME: {mime_type})")
     if CRED_TYPE == "API":
         try:
             file_resource = await client.aio.files.upload(file=image_path, config={"mime_type": mime_type})
-            upload_name = file_resource
+            upload_name = file_resource.name
             logging.info(f"Image Successfully Uploaded: {upload_name}")
 
             return file_resource
         except Exception as e:
-            logging.error(f"--- SDK Upload Failed for {image_path.name}: {e}")
+            logging.error(f"SDK Upload Failed for {image_path.name}: {e}")
             return None
     elif CRED_TYPE == "OAUTH":
         try:
@@ -328,13 +377,13 @@ async def upload_file(image_path, mime_type: str):
 
 
 async def delete_file(file_name):
-    logging.info(f"--- Calling SDK Delete: {file_name}")
+    logging.info(f"Calling SDK Delete: {file_name}")
     if CRED_TYPE == "API":
         try:
             await client.aio.files.delete(name=file_name)
             logging.info(f"Deleted: {file_name}")
         except Exception as e:
-            logging.error(f"--- SDK Upload Failed for {file_name}: {e}")
+            logging.error(f"SDK Upload Failed for {file_name}: {e}")
             pass
     elif CRED_TYPE == "OAUTH":
         logging.info(f"Using {CRED_TYPE}, deletion not necessary.")
@@ -357,7 +406,8 @@ class ImageAnalysis(BaseModel):
     tags: list[str] = Field(description="A list of 3 keywords that describe the image.")
     objects: list[ObjectDetection] = Field(
         default_factory=list,
-        description="A list of objects detected in the image.",
+        description="A list of up to 50 objects detected in the image.",
+        max_length=50,
     )
 
 
@@ -368,207 +418,6 @@ class PermanentAnalysisError(ValueError):
     """
 
     pass
-
-
-async def get_gemini_analysis_and_vector(
-    file_resource: types.File,
-    uploaded_mime_type: str,
-    is_sprite_sheet: bool = False,
-):
-
-    file_name_for_logging = file_resource["file_name"] if isinstance(file_resource, dict) else file_resource.name
-    logging.info(f"--- Calling SDK GenerateContent for file: {file_name_for_logging}")
-
-    caption = None
-    tags = []
-    vector_embedding = None
-    response = None
-
-    try:
-        if is_sprite_sheet:
-            prompt_text = "Analyze this image, which is a sprite sheet of 5 frames from a GIF "
-            "laid out horizontally from left to right. Describe the full action or "
-            "animation from start to finish, then provide the requested structured data."
-        else:
-            prompt_text = "Analyze the image and provide the requested structured data."
-
-        if CRED_TYPE == "API":
-            contents = [Part.from_text(text=prompt_text), file_resource]
-        elif isinstance(file_resource, dict):
-            contents = [
-                Part.from_text(text=prompt_text),
-                Part.from_bytes(data=file_resource["bytes"], mime_type=uploaded_mime_type),
-            ]
-        else:
-            logging.critical(f"Invalid file_resource type: {type(file_resource)}. Exiting...")
-            sys.exit(0)
-
-        image_analysis_json_schema = {
-            "type": "object",
-            "properties": {
-                "caption": {
-                    "type": "string",
-                    "description": "A short, concise description about the image.",
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "A list of 3 keywords that describe the image.",
-                },
-                "objects": {
-                    "type": "array",
-                    "description": "A list of objects detected in the image.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "box_2d": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Normalized coordinates [y0, x0, y1, x1] (0-1000).",
-                            },
-                            "label": {
-                                "type": "string",
-                                "description": "A descriptive label for the object.",
-                            },
-                        },
-                        "required": ["box_2d", "label"],
-                    },
-                },
-            },
-            "required": ["caption", "tags"],
-        }
-
-        safety_settings = [
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold=types.HarmBlockThreshold.OFF,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold=types.HarmBlockThreshold.OFF,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold=types.HarmBlockThreshold.OFF,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold=types.HarmBlockThreshold.OFF,
-            ),
-        ]
-
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_json_schema=image_analysis_json_schema,
-            thinking_config=types.ThinkingConfig(include_thoughts=False),
-            should_return_http_response=True,
-            safety_settings=safety_settings,
-        )
-
-        response = await client.aio.models.generate_content(model=AI_MODEL, contents=contents, config=config)
-
-        if not response or not response.text:
-            logging.error("Empty response.text from Gemini")
-            # This is a permanent failure, do not retry
-            raise PermanentAnalysisError("Gemini AI model returned empty response.text")
-
-        try:
-            resp_json = json.loads(response.text)
-
-            # Defensive check for blocking or empty content returned by model
-            if "promptFeedback" in resp_json and resp_json["promptFeedback"].get("blockReason"):
-                block_reason = resp_json["promptFeedback"]["blockReason"]
-                logging.error(f"Model blocked request with reason: {block_reason}")
-                raise PermanentAnalysisError(f"Gemini AI model blocked request: {block_reason}")
-
-            # Defensive check: ensure expected keys exist to avoid parse errors
-            if not resp_json.get("caption") or not resp_json.get("tags"):
-                logging.error("Response missing required keys 'caption' or 'tags'. Treating as empty.")
-                raise PermanentAnalysisError("Gemini AI model returned incomplete response")
-
-            # Parse analysis object from JSON using Pydantic
-            analysis_object = ImageAnalysis.model_validate_json(response.text)
-            caption = analysis_object.caption
-            tags = analysis_object.tags
-
-        except (ValidationError, JSONDecodeError) as e:
-            logging.error(f"Failed to parse model's JSON response: {e}")
-            if response and hasattr(response, "text"):
-                logging.error(f"Raw Model Response: {response.text}")
-            # This is also a permanent failure
-            raise PermanentAnalysisError(f"Failed to parse model's JSON response: {e}")
-        # --- End of parsing block ---
-
-        logging.info(f"--- Analysis Success: {caption[:30].strip()}...")
-
-    except genai.errors.ClientError as e:
-        logging.error(f"--- [Client Error]: SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
-        if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
-            logging.error(f"--- API Error Body: {e.response.text}")
-        raise  # Re-raise transient ClientErrors to be caught by the retry wrapper
-
-    except Exception as e:
-        # Catch our own PermanentAnalysisError and other unexpected errors
-        if not isinstance(e, PermanentAnalysisError):
-            logging.error(f"--- SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
-        raise  # Re-raise all errors
-
-    # Generate embeddings for the caption (if analysis succeeded)
-    try:
-        logging.info("Generating Embeddings...")
-        vector_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL, contents=[caption])
-        if vector_response.embeddings:
-            vector_embedding = vector_response.embedding.values
-            logging.info(f"--- Embedding Success")
-        else:
-            raise PermanentAnalysisError("EmbedContentResponse returned no embeddings.")
-
-        return caption, tags, vector_embedding
-
-    except Exception as e:
-        if not isinstance(e, PermanentAnalysisError):
-            logging.error(f"--- SDK Embedding FAILED: {e}")
-        raise  # Re-raise all errors
-
-
-async def get_gemini_analysis_and_vector_with_retries(
-    file_resource: types.File,
-    uploaded_mime_type: str,
-    is_sprite_sheet: bool = False,
-    max_retries: int = 3,
-    backoff_factor: float = 1.5,
-):
-    attempt = 0
-    while attempt < max_retries:
-        try:
-            return await get_gemini_analysis_and_vector(file_resource, uploaded_mime_type, is_sprite_sheet)
-
-        # --- MODIFICATION 3 (Smarter exception handling) ---
-        except Exception as e:
-            # Check if this is a permanent failure that should NOT be retried
-            if isinstance(e, PermanentAnalysisError):
-                if CRED_TYPE == "API":
-                    logging.error(f"Permanent failure for {file_resource.name}: {e}. No retries will be attempted.")
-                else:
-                    logging.error(f"Permanent failure for Inline Image: {e}. No retries will be attempted.")
-                raise e  # Re-raise the permanent error to stop the loop
-
-            # Handle transient errors (e.g., ClientError, network issues)
-            logging.warning(f"Attempt {attempt + 1} failed with transient error: {e}. Retrying...")
-
-        attempt += 1
-
-        # Only sleep if we are not on the last attempt
-        if attempt < max_retries:
-            sleep_time = backoff_factor**attempt
-            logging.info(f"Sleeping {sleep_time:.2f} seconds before retry...")
-            await asyncio.sleep(sleep_time)
-
-    # If the loop finishes, it means all retries failed
-    if CRED_TYPE == "API":
-        raise RuntimeError(f"Failed to get valid Gemini analysis for {file_resource.name} after {max_retries} attempts")
-    else:
-        raise RuntimeError(f"Failed to get valid Gemini analysis for Inline Image after {max_retries} attempts")
 
 
 def sync_convert_gif_to_sprite_sheet(gif_path, temp_path, num_frames=5):
@@ -632,13 +481,11 @@ async def convert_gif_to_sprite_sheet(gif_path, temp_path, num_frames=5):
 
 
 async def get_gemini_analysis_and_vector(
-    file_resource: Union[types.File, dict],
-    uploaded_mime_type: str,
-    is_sprite_sheet: bool = False,
+    file_resource: Union[types.File, dict], uploaded_mime_type: str, is_sprite_sheet: bool = False
 ):
 
     file_name_for_logging = file_resource["file_name"] if isinstance(file_resource, dict) else file_resource.name
-    logging.info(f"--- Calling SDK GenerateContent for file: {file_name_for_logging}")
+    logging.info(f"Calling SDK GenerateContent for file: {file_name_for_logging}")
 
     caption = None
     tags = []
@@ -647,9 +494,10 @@ async def get_gemini_analysis_and_vector(
 
     try:
         if is_sprite_sheet:
-            prompt_text = "Analyze this image, which is a sprite sheet of 5 frames from a GIF "
+            prompt_text = "Analyze this image, which is a sprite sheet of 5 frames from a GIF"
             "laid out horizontally from left to right. Describe the full action or "
             "animation from start to finish, then provide the requested structured data."
+            "Do not include the phrase sprite sheet in your description."
         else:
             prompt_text = "Analyze the image and provide the requested structured data."
 
@@ -665,41 +513,6 @@ async def get_gemini_analysis_and_vector(
         else:
             logging.critical(f"Invalid file_resource type: {type(file_resource)}. Exiting...")
             sys.exit(0)
-
-        image_analysis_json_schema = {
-            "type": "object",
-            "properties": {
-                "caption": {
-                    "type": "string",
-                    "description": "A short, concise description about the image.",
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "A list of 3 keywords that describe the image.",
-                },
-                "objects": {
-                    "type": "array",
-                    "description": "A list of objects detected in the image.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "box_2d": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Normalized coordinates [y0, x0, y1, x1] (0-1000).",
-                            },
-                            "label": {
-                                "type": "string",
-                                "description": "A descriptive label for the object.",
-                            },
-                        },
-                        "required": ["box_2d", "label"],
-                    },
-                },
-            },
-            "required": ["caption", "tags"],
-        }
 
         safety_settings = [
             types.SafetySetting(
@@ -723,17 +536,18 @@ async def get_gemini_analysis_and_vector(
 
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_json_schema=image_analysis_json_schema,
+            response_json_schema=ImageAnalysis.model_json_schema(),
             thinking_config=types.ThinkingConfig(include_thoughts=False),
-            should_return_http_response=True,
+            should_return_http_response=False,
             safety_settings=safety_settings,
         )
 
         response = await client.aio.models.generate_content(model=AI_MODEL, contents=contents, config=config)
 
-        # --- *** FIX: Added robust JSON parsing and validation *** ---
+        # *** FIX: Added robust JSON parsing and validation *** ---
         if not response or not response.text:
             logging.error("Empty response.text from Gemini")
+            logging.error(f"Full response object from Gemini: {response}")
             # This is a permanent failure, do not retry
             raise PermanentAnalysisError("Gemini AI model returned empty response.text")
 
@@ -741,8 +555,10 @@ async def get_gemini_analysis_and_vector(
             resp_json = json.loads(response.text)
 
             # Defensive check for blocking or empty content returned by model
-            if "promptFeedback" in resp_json and resp_json["promptFeedback"].get("blockReason"):
-                block_reason = resp_json["promptFeedback"]["blockReason"]
+            if "prompt_feedback" in resp_json and resp_json["prompt_feedback"][
+                "GenerateContentResponsePromptFeedback"
+            ].get("block_reason"):
+                block_reason = resp_json["prompt_feedback"]["block_reason"]
                 logging.error(f"Model blocked request with reason: {block_reason}")
                 raise PermanentAnalysisError(f"Gemini AI model blocked request: {block_reason}")
 
@@ -762,20 +578,26 @@ async def get_gemini_analysis_and_vector(
                 logging.error(f"Raw Model Response: {response.text}")
             # This is also a permanent failure
             raise PermanentAnalysisError(f"Failed to parse model's JSON response: {e}")
-        # --- End of parsing block ---
+        # End of parsing block ---
 
-        logging.info(f"--- Analysis Success: {caption[:30].strip()}...")
+        logging.info(f"Analysis Success: {caption[:30].strip()}...")
 
     except genai.errors.ClientError as e:
-        logging.error(f"--- [Client Error]: SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
+        logging.error(f"[Client Error]: SDK Combined Analysis FAILED for {file_name_for_logging}")
         if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
-            logging.error(f"--- API Error Body: {e.response.text}")
+            try:
+                error_body = json.loads(e.response.text)
+                error_code = error_body.get("error", {}).get("code")
+                error_status = error_body.get("error", {}).get("status")
+                logging.error(f"API Error Body: [{error_code}] Status: {error_status}")
+            except json.JSONDecodeError:
+                logging.error(f"API Error Body: Could not parse JSON: {e.response.text}")
         raise  # Re-raise transient ClientErrors to be caught by the retry wrapper
 
     except Exception as e:
         # Catch our own PermanentAnalysisError and other unexpected errors
         if not isinstance(e, PermanentAnalysisError):
-            logging.error(f"--- SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
+            logging.error(f"SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
         raise  # Re-raise all errors
 
     # Generate embeddings for the caption (if analysis succeeded)
@@ -783,8 +605,9 @@ async def get_gemini_analysis_and_vector(
         logging.info("Generating Embeddings...")
         vector_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL, contents=[caption])
         if vector_response.embeddings:
-            vector_embedding = vector_response.embedding.values
-            logging.info(f"--- Embedding Success")
+            # The response contains a list of embeddings. Get the values from the first one.
+            vector_embedding = vector_response.embeddings[0].values
+            logging.info("Embedding Success")
         else:
             raise PermanentAnalysisError("EmbedContentResponse returned no embeddings.")
 
@@ -792,19 +615,124 @@ async def get_gemini_analysis_and_vector(
 
     except Exception as e:
         if not isinstance(e, PermanentAnalysisError):
-            logging.error(f"--- SDK Embedding FAILED: {e}")
+            logging.error(f"SDK Embedding FAILED: {e}")
         raise  # Re-raise all errors
+
+
+def _parse_retry_delay(e: genai.errors.ClientError) -> Optional[float]:
+    """
+    Parses the 'retryDelay' from a Google API ClientError response.
+    Returns the delay in seconds (as a float) or None if not found.
+    """
+    if not (hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text):
+        return None
+
+    try:
+        error_body = json.loads(e.response.text)
+        details = error_body.get("error", {}).get("details", [])
+
+        for detail in details:
+            if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
+                delay_str = detail.get("retryDelay")
+
+                # Parse strings like "26s" or "26.500510823s"
+                if delay_str and delay_str.endswith("s"):
+                    try:
+                        return float(delay_str[:-1])
+                    except (ValueError, TypeError):
+                        logging.warning(f"Could not parse retryDelay value: {delay_str}")
+                        return None
+    except json.JSONDecodeError:
+        logging.warning("Could not parse API error body JSON.")
+        return None
+    except Exception as parse_err:
+        logging.warning(f"Unexpected error parsing retryDelay: {parse_err}")
+        return None
+
+    return None
+
+
+async def get_gemini_analysis_and_vector_with_retries(
+    file_resource: Union[types.File, dict],
+    uploaded_mime_type: str,
+    is_sprite_sheet: bool = False,
+    max_retries: int = 3,
+    backoff_factor: float = 2.0,
+):
+    global AI_MODEL
+    available_models = await get_available_models()
+    if not available_models:
+        raise RuntimeError("No available models for content generation.")
+
+    if AI_MODEL not in available_models:
+        logging.warning(f"Default model {AI_MODEL} not in available list. Using first available: {available_models[0]}")
+        AI_MODEL = available_models[0]
+
+    current_model_index = available_models.index(AI_MODEL)
+
+    file_name_for_logging = file_resource["file_name"] if isinstance(file_resource, dict) else file_resource.name
+
+    while current_model_index < len(available_models):
+        AI_MODEL = available_models[current_model_index]
+        logging.info(f"Using model: {AI_MODEL}")
+
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                return await get_gemini_analysis_and_vector(file_resource, uploaded_mime_type, is_sprite_sheet)
+
+            except PermanentAnalysisError as e:
+                logging.critical(f"Permanent failure for {file_name_for_logging}: {e}. No retries will be attempted.")
+                raise e
+
+            except Exception as e:
+                logging.warning(f"Attempt {attempt + 1} for model {AI_MODEL} failed for {file_name_for_logging}.")
+
+                sleep_time = 0.0
+                if str(NO_RETRY_DELAY) == "1":
+                    logging.warning("No Retry Delay, doing next attempt immediately.")
+                else:
+                    # Default to exponential backoff
+                    sleep_time = backoff_factor**attempt
+                    if (
+                        isinstance(e, genai.errors.ClientError)
+                        and hasattr(e, "response")
+                        and e.response
+                        and e.response.status_code == 429
+                    ):
+                        logging.warning("[429 Error]: Resource Exhausted. Trying to parse retryDelay...")
+                        parsed_sleep_time = _parse_retry_delay(e)
+                        if parsed_sleep_time is not None:
+                            sleep_time = parsed_sleep_time + 3
+                            logging.warning(f"API requested retry in {sleep_time:.2f}s. Waiting...")
+                        else:
+                            logging.warning("Could not parse retryDelay. Using exponential backoff.")
+                    else:
+                        logging.warning(f"Transient error: {e}. Using exponential backoff.")
+
+                attempt += 1
+                if attempt < max_retries:
+                    if sleep_time > 0:
+                        logging.info(f"Sleeping {sleep_time:.2f} seconds before retry...")
+                    await asyncio.sleep(sleep_time)
+
+        logging.warning(f"All retries failed for model {AI_MODEL}.")
+        current_model_index += 1
+
+    raise RuntimeError(
+        f"Failed to get valid Gemini analysis for {file_name_for_logging} after trying all available models."
+    )
 
 
 async def index_image(session: AsyncSession, image_path, user_id):
     await asyncio.sleep(0.05)
-    logging.info(f"\n[Indexing] Starting image: {image_path.name}")
+    logging.info(f"[Indexing] Starting image: {image_path.name}")
 
-    # --- CHECK IF IMAGE ALREADY EXISTS ---
-    existing = await session.execute(select(Image).filter_by(filename=image_path.name))
-    if existing.scalar_one_or_none():
-        logging.info(f"[Indexing] SKIPPED: {image_path.name} (already indexed)")
-        return
+    # CHECK IF IMAGE ALREADY EXISTS ---
+    # existing = await session.execute(select(Image).filter_by(filename=image_path.name))
+    # if existing.scalar_one_or_none():
+    # logging.info(f"[Indexing] SKIPPED: {image_path.name} (already indexed)")
+    # return
 
     file_resource = None  # Can be types.File or dict
     temp_image_path = None
@@ -814,7 +742,7 @@ async def index_image(session: AsyncSession, image_path, user_id):
     orig_mime = ""  # <-- Store original mime type
 
     try:
-        # --- 1. NORMALIZE FILE AND MIME TYPE ---
+        # 1. NORMALIZE FILE AND MIME TYPE ---
         # *** FIX: Check with dot ***
         if original_ext == ".jpg":
             mime_type = "image/jpeg"
@@ -927,11 +855,11 @@ async def index_image(session: AsyncSession, image_path, user_id):
         # Do not re-raise, allow the process to continue with other images
 
     except genai.errors.ClientError as e:
-        logging.error(f"--- [Client Error] index_image: {e}")
+        logging.error(f"[Client Error] index_image: {e}")
         if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
-            logging.error(f"--- API Error Body: {e.response.text}")
+            logging.error(f"API Error Body: {e.response.text}")
     except errors.APIError as e:
-        logging.error(f"--- [Indexing Error] {e.code}: {e.message}")
+        logging.error(f"[Indexing Error] {e.code}: {e.message}")
 
     except Exception as e:
         logging.error(f"[Indexing] An error occurred while indexing {image_path.name}: {e}")
@@ -953,14 +881,55 @@ async def index_image(session: AsyncSession, image_path, user_id):
                 logging.error(f"Failed to clean up temp file: {e}")
 
 
-async def run_indexing_async(Session: async_sessionmaker, user_id, gallery_dir, image_paths_to_index):
+async def scan_image_dir_skip(Session: async_sessionmaker):
+    gallery_dir = Path(IMAGE_GALLERY)
+
+    image_paths_on_disk = []
+    for p in gallery_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
+            image_paths_on_disk.append(p)
+        elif p.is_file():
+            logging.info(f"[Scanning] SKIPPED: {p.name} (Not an image file)")
+
+    if not image_paths_on_disk:
+        logging.warning("[Setup] No images found to index in the gallery directory.")
+        return []
+
+    # Get all filenames from disk
+    filenames_on_disk = {p.name for p in image_paths_on_disk}
+
+    # Get all existing filenames from DB in one query
+    async with Session() as session:
+        result = await session.execute(select(Image.filename).where(Image.filename.in_(filenames_on_disk)))
+        existing_filenames_in_db = {row[0] for row in result}
+
+    # Find the difference
+    new_filenames = filenames_on_disk - existing_filenames_in_db
+
+    # Create a map of filename to path for quick lookup
+    path_map = {p.name: p for p in image_paths_on_disk}
+
+    checked_image_paths = [path_map[name] for name in new_filenames]
+
+    num_skipped = len(filenames_on_disk) - len(new_filenames)
+
+    if num_skipped > 0:
+        logging.info(f"[Scanning] Skipped {num_skipped} already indexed images.")
+
+    if checked_image_paths:
+        logging.info(f"[Scanning] Found {len(checked_image_paths)} new images to index.")
+
+    return checked_image_paths
+
+
+async def run_indexing_async(Session: async_sessionmaker, user_id, image_paths_to_index):
 
     # This semaphore belongs to the outer function
     sem = asyncio.Semaphore(int(SEMAPHORE_LIMIT))
 
-    # --- DEFINE THE TASK FUNCTION *INSIDE* ---
+    # DEFINE THE TASK FUNCTION *INSIDE* ---
     # This lets it access 'sem' and 'Session'
-    async def controlled_index_task(path, user_id):
+    async def controlled_index_task(path, user_id, is_last=False):
         async with Session() as session:
             async with sem:
                 try:
@@ -971,22 +940,76 @@ async def run_indexing_async(Session: async_sessionmaker, user_id, gallery_dir, 
                     logging.error(f"[Indexing] FAILED/ROLLED BACK: {path.name}. Error: {e}")
                     await session.rollback()
                 finally:
-                    # --- ADD THIS DELAY ---
-                    # Force a wait to stay under the RPM limit
-                    logging.info(f"[Concurrency] Waiting {INDEX_TASK_DELAY}s to respect rate limit...")
-                    # Convert to int in case it's read from .env as str
-                    await asyncio.sleep(int(INDEX_TASK_DELAY))
+                    # ADD THIS DELAY ---
+                    # Force a wait to stay under the RPM limit, but not for the last item
+                    if not is_last:
+                        logging.info(f"[Concurrency] Waiting {INDEX_TASK_DELAY}s to respect rate limit...")
+                        # Convert to int in case it's read from .env as str
+                        await asyncio.sleep(int(INDEX_TASK_DELAY))
 
-    # --- THIS BLOCK RUNS THE TASKS ---
+    # THIS BLOCK RUNS THE TASKS ---
     # It must be indented inside run_indexing_async, NOT controlled_index_task
     try:
         logging.info(f"[Concurrency] Limiting concurrent indexing tasks to {SEMAPHORE_LIMIT}.")
-        tasks = [controlled_index_task(path, user_id) for path in image_paths_to_index]
+        num_tasks = len(image_paths_to_index)
+        tasks = []
+        for i, path in enumerate(image_paths_to_index):
+            is_last = i == num_tasks - 1
+            tasks.append(controlled_index_task(path, user_id, is_last=is_last))
 
         await asyncio.gather(*tasks)
         logging.info("\n[Indexing] All concurrent tasks completed")
     except Exception as e:
         logging.error(f"\n[Indexing] FATAL ERROR during concurrent run: {e}")
+
+
+async def find_and_delete_incomplete_entries(Session: async_sessionmaker):
+    """
+    Finds and deletes images in the database that are missing an AI caption, AI-generated tags, or a vector embedding.
+    Returns a list of file paths for the deleted images to be re-indexed.
+    """
+    paths_to_rescan = []
+    async with Session() as session:
+        # Subquery to find image_ids that have at least one AI-generated keyword tag.
+        subquery = select(ImageTagXref.image_id).join(Tag).where(Tag.tag_category == "AI_Keyword").distinct()
+
+        # Query for images that are missing a caption, AI tags, or a vector.
+        stmt = (
+            select(Image)
+            .outerjoin(Image.vector)
+            .where(
+                or_(
+                    (Image.ai_caption == None) | (Image.ai_caption == ""),
+                    Image.image_id.notin_(subquery),
+                    FeatureVector.image_id == None,
+                )
+            )
+        )
+
+        result = await session.execute(stmt)
+        incomplete_images = result.scalars().unique().all()
+
+        if not incomplete_images:
+            return []
+
+        logging.info(
+            f"[Scanning] Found {len(incomplete_images)} incomplete entries. They will be deleted and re-indexed."
+        )
+
+        for image in incomplete_images:
+            image_path = Path(image.local_file_path)
+            if image_path.exists():
+                paths_to_rescan.append(image_path)
+                await session.delete(image)
+            else:
+                logging.warning(
+                    f"[Scanning] Incomplete entry found, but file is missing: {image.local_file_path}. Deleting from DB."
+                )
+                await session.delete(image)
+
+        await session.commit()
+
+    return paths_to_rescan
 
 
 async def embed_text_query(query, task_type: str = "SEMANTIC_SIMILARITY"):
@@ -1005,13 +1028,13 @@ async def embed_text_query(query, task_type: str = "SEMANTIC_SIMILARITY"):
         return query_vector
 
     except genai.errors.ClientError as e:
-        logging.error(f"--- [Client Error] get_gemini_client: {e}")
+        logging.error(f"[Client Error] get_gemini_client: {e}")
 
         if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
-            logging.error(f"--- API Error Body: {e.response.text}")
+            logging.error(f"API Error Body: {e.response.text}")
 
     except errors.APIError as e:
-        logging.error(f"--- [Embedding Error] {e.code}: {e.message}")
+        logging.error(f"[Embedding Error] {e.code}: {e.message}")
 
     except Exception as e:
         logging.error(f"[Embed Utility] ERROR: Could not generate embedding for query: {e}")
@@ -1024,7 +1047,7 @@ async def find_similar_images(Session: async_sessionmaker, query, limit: int = 5
         return []
 
     results = []
-    # --- Use async session ---
+    # Use async session ---
     async with Session() as session:
         try:
             # Define the distance operation
@@ -1032,7 +1055,7 @@ async def find_similar_images(Session: async_sessionmaker, query, limit: int = 5
                 query_vector = tuple(query_vector)
             distance = FeatureVector.vector_embedding.op("<->")(query_vector).label("distance")
 
-            # --- Use SQLAlchemy 2.0 select() style ---
+            # Use SQLAlchemy 2.0 select() style ---
             query_stmt = (
                 select(Image, distance)
                 .join(FeatureVector, Image.image_id == FeatureVector.image_id)
@@ -1058,11 +1081,11 @@ async def find_similar_images(Session: async_sessionmaker, query, limit: int = 5
                     }
                 )
         except genai.errors.ClientError as e:
-            logging.error(f"--- [Client Error] get_gemini_client: {e}")
+            logging.error(f"[Client Error] get_gemini_client: {e}")
             if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
-                logging.error(f"--- API Error Body: {e.response.text}")
+                logging.error(f"API Error Body: {e.response.text}")
         except errors.APIError as e:
-            logging.error(f"--- [Vector Error] {e.code}: {e.message}")
+            logging.error(f"[Vector Error] {e.code}: {e.message}")
         except Exception as e:
             logging.error(f"[Search] FATAL ERROR during vector query: {e}")
             # No rollback needed on SELECT, session closes automatically
@@ -1089,7 +1112,7 @@ async def initialize_database(db_url):
     )
 
     try:
-        # --- Use async connection to run setup ---
+        # Use async connection to run setup ---
         async with engine.begin() as conn:
             logging.info("Enabling pgvector extension if not already present...")
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
@@ -1103,7 +1126,7 @@ async def initialize_database(db_url):
 
     logging.info("Database initialization complete.")
 
-    # --- Create async sessionmaker ---
+    # Create async sessionmaker ---
     Session = async_sessionmaker(
         bind=engine,
         expire_on_commit=False,  # Important for accessing objects after commit
@@ -1120,50 +1143,48 @@ async def main():
 
     gallery_dir = Path(IMAGE_GALLERY)
     if not gallery_dir.is_dir():
-        logging.error(f"\n[ERROR] The directory '{gallery_dir}' does not exist.")
+        logging.error(f"[ERROR] The directory '{gallery_dir}' does not exist.")
         sys.exit(1)
 
-    logging.info(f"\n[Setup] Scanning image directory: {gallery_dir}")
+    logging.info(f"[Setup] Scanning image directory for new and incomplete files: {gallery_dir}")
 
-    image_paths_to_index = []
-    for p in gallery_dir.iterdir():
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
-            image_paths_to_index.append(p)
-        elif p.is_file():
-            logging.info(f"[Scanning] SKIPPED: {p.name} (Not an image file)")
+    # Find new images that are on disk but not in the DB
+    new_image_paths = await scan_image_dir_skip(Session)
 
-    if not image_paths_to_index:
-        logging.warning("[Setup] No images found to index in the gallery directory.")
-        # We can continue, to allow searching existing images
+    # Find and delete incomplete entries from the DB, and get their paths for re-indexing
+    incomplete_paths_to_rescan = await find_and_delete_incomplete_entries(Session)
 
-    mock_user = None
-    # --- Async setup for mock user ---
-    async with Session() as setup_session:
+    # Combine lists and remove duplicates
+    final_paths_to_index = list(set(new_image_paths + incomplete_paths_to_rescan))
+
+    if final_paths_to_index:
+        mock_user = None
+        # Async setup for mock user ---
+        async with Session() as setup_session:
+            try:
+                user_result = await setup_session.execute(select(User).filter_by(username="image_indexer_bot"))
+                mock_user = user_result.scalar_one_or_none()
+
+                if not mock_user:
+                    logging.info("Creating mock user 'image_indexer_bot'...")
+                    mock_user = User(username="image_indexer_bot", email="indexer@example.com")
+                    setup_session.add(mock_user)
+                    await setup_session.commit()
+                    logging.info(f"Mock user created with ID: {mock_user.user_id}")
+                else:
+                    logging.info(f"Found existing mock user with ID: {mock_user.user_id}")
+            except Exception as e:
+                logging.error(f"Failed to create or find mock user: {e}")
+                await setup_session.rollback()
+                sys.exit(1)
         try:
-            user_result = await setup_session.execute(select(User).filter_by(username="image_indexer_bot"))
-            mock_user = user_result.scalar_one_or_none()
-
-            if not mock_user:
-                logging.info("Creating mock user 'image_indexer_bot'...")
-                mock_user = User(username="image_indexer_bot", email="indexer@example.com")
-                setup_session.add(mock_user)
-                await setup_session.commit()
-                logging.info(f"Mock user created with ID: {mock_user.user_id}")
-            else:
-                logging.info(f"Found existing mock user with ID: {mock_user.user_id}")
-        except Exception as e:
-            logging.error(f"Failed to create or find mock user: {e}")
-            await setup_session.rollback()
-            sys.exit(1)
-
-    if image_paths_to_index:
-        try:
-            logging.info(f"\n[Indexing] Starting to index {len(image_paths_to_index)} images...")
-            await run_indexing_async(Session, mock_user.user_id, gallery_dir, image_paths_to_index)
+            logging.info(f"[Indexing] Starting to index {len(final_paths_to_index)} new and/or incomplete images...")
+            await run_indexing_async(Session, mock_user.user_id, final_paths_to_index)
         except KeyboardInterrupt:
-            logging.info("\n Indexing interrupted by user.")
+            logging.info("Indexing interrupted by user.")
+            sys.exit(0)
     else:
-        logging.info("\n[Indexing] Skipping indexing as no new images were found.")
+        logging.info("[Indexing] No new or incomplete images to index.")
 
     logging.info("\n" + "=" * 50)
     logging.info("PERFORMING SEMANTIC SEARCH TEST")
@@ -1200,7 +1221,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    # --- Run the main async function ---
+    # Run the main async function ---
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
