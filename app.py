@@ -64,8 +64,8 @@ AI_MODEL = "gemini-2.5-flash-lite"
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TEMP_DIRECTORY = os.getenv("TEMP_DIRECTORY", "temp")
 NO_BROWSER = os.getenv("NO_BROWSER", False)
-SEMAPHORE_LIMIT = os.getenv("SEMAPHORE_LIMIT", 1)
-INDEX_TASK_DELAY = os.getenv("INDEX_TASK_DELAY", 32)
+SEMAPHORE_LIMIT = os.getenv("SEMAPHORE_LIMIT", 3)
+INDEX_TASK_DELAY = os.getenv("INDEX_TASK_DELAY", 5)
 CRED_TYPE = "API"
 NO_RETRY_DELAY = os.getenv("NO_RETRY_DELAY", 0)
 
@@ -200,9 +200,17 @@ Base = declarative_base()
 # class GeminiModelManager:
 
 
-async def get_available_ai_models():
-    global client
+_model_cache = None
 
+
+async def get_available_ai_models():
+    global client, _model_cache
+
+    if _model_cache:
+        logging.debug("Returning cached model list.")
+        return _model_cache
+
+    logging.info("Fetching available models from the API...")
     """Gets a sorted list of available models that support content generation."""
     ai_models = []
     embed_models = []
@@ -230,8 +238,10 @@ async def get_available_ai_models():
     embed_models.sort(reverse=True)
     ai_models.sort(reverse=True)
 
-    logging.debug(f"{embed_models}")
-    logging.debug(f"{ai_models}")
+    _model_cache = (ai_models, embed_models)
+
+    logging.debug(f"Number of available embedding models: {len(embed_models)}")
+    logging.debug(f"Number of available AI models: {len(ai_models)}")
 
     return ai_models, embed_models
 
@@ -301,7 +311,7 @@ class Tag(Base):
     __tablename__ = "tags"
 
     tag_id = Column(BigInteger, primary_key=True, autoincrement=True)
-    tag_name = Column(String(100), nullable=False, unique=True)
+    tag_name = Column(String(100), nullable=False, unique=False)
     tag_category = Column(String(50))
 
     # Relationships
@@ -540,16 +550,17 @@ async def get_gemini_analysis_with_retries(
     is_sprite_sheet: bool = False,
     max_retries: int = 3,
     backoff_factor: float = 2.0,
+    available_ai_models: list = [],
 ):
     global AI_MODEL
 
-    available_ai_models, _ = await get_available_ai_models()
-    if not available_ai_models:
-        raise RuntimeError("No available AI models for content generation.")
+    # available_ai_models, _ = await get_available_ai_models()
+    # if not available_ai_models:
+    #     raise RuntimeError("No available AI models for content generation.")
 
-    if AI_MODEL not in available_ai_models:
-        logging.warning(f"Default model {AI_MODEL} not in available list. Using first available: {available_ai_models[0]}")
-        AI_MODEL = available_ai_models[0]
+    # if AI_MODEL not in available_ai_models:
+    #     logging.warning(f"Default model {AI_MODEL} not in available list. Using first available: {available_ai_models[0]}")
+    #     AI_MODEL = available_ai_models[0]
 
     current_model_index = available_ai_models.index(AI_MODEL)
 
@@ -608,20 +619,16 @@ async def get_gemini_analysis_with_retries(
     raise RuntimeError(f"Failed to get valid Gemini analysis for {file_name_for_logging} after trying all available models.")
 
 
-async def get_embedding_with_retries(
-    contents,
-    max_retries: int = 3,
-    backoff_factor: float = 2.0,
-):
+async def get_embedding_with_retries(contents, max_retries: int = 3, backoff_factor: float = 2.0, available_embed_models: list = []):
     global EMBEDDING_MODEL
 
-    _, available_embed_models = await get_available_ai_models()
-    if not available_embed_models:
-        raise RuntimeError("No avaliable Embedding Models")
+    # _, available_embed_models = await get_available_ai_models()
+    # if not available_embed_models:
+    #     raise RuntimeError("No avaliable Embedding Models")
 
-    if EMBEDDING_MODEL not in available_embed_models:
-        logging.warning(f"Default model {EMBEDDING_MODEL} not in available list. Using first available: {available_embed_models[0]}")
-        EMBEDDING_MODEL = available_embed_models[0]
+    # if EMBEDDING_MODEL not in available_embed_models:
+    #     logging.warning(f"Default model {EMBEDDING_MODEL} not in available list. Using first available: {available_embed_models[0]}")
+    #     EMBEDDING_MODEL = available_embed_models[0]
 
     current_embed_index = available_embed_models.index(EMBEDDING_MODEL)
 
@@ -761,6 +768,11 @@ async def get_gemini_analysis(file_resource: Union[types.File, dict], uploaded_m
             analysis_object = ImageAnalysis.model_validate_json(response.text)
             caption = analysis_object.caption
             tags = analysis_object.tags
+            objects = analysis_object.objects
+
+            logging.debug(f"Caption: {caption}")
+            logging.debug(f"Tags: {tags}")
+            logging.debug(f"Found {len(objects)} objects.")
 
         except (ValidationError, JSONDecodeError) as e:
             logging.error(f"Failed to parse model's JSON response: {e}")
@@ -769,7 +781,7 @@ async def get_gemini_analysis(file_resource: Union[types.File, dict], uploaded_m
             raise PermanentAnalysisError(f"Failed to parse model's JSON response: {e}")
 
         logging.info(f"Analysis Success: {caption[:30].strip()}...")
-        return caption, tags, contents
+        return caption, tags, objects
 
     except genai.errors.ClientError as e:
         logging.error(f"[Client Error]: SDK Combined Analysis FAILED for {file_name_for_logging}")
@@ -792,10 +804,15 @@ async def get_gemini_analysis(file_resource: Union[types.File, dict], uploaded_m
 async def get_embedding(contents):
     try:
         logging.info("Generating Embeddings...")
-        vector_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL, contents=contents)
+        vector_response = await client.aio.models.embed_content(
+            model=EMBEDDING_MODEL, contents=contents, config=types.EmbedContentConfig(output_dimensionality=768)
+        )
         if vector_response.embeddings:
             vector_embedding = vector_response.embeddings[0].values
             logging.info("Embedding Success")
+
+            logging.debug(f"Embedding generated with dimension: {len(vector_embedding)}")
+
             return vector_embedding
         else:
             raise PermanentAnalysisError("EmbedContentResponse returned no embeddings.")
@@ -811,11 +828,43 @@ async def get_embedding(contents):
         raise
 
 
+async def get_current_models():
+    global AI_MODEL
+    global EMBEDDING_MODEL
+
+    available_ai_models, available_embed_models = await get_available_ai_models()
+
+    if not available_embed_models:
+        raise RuntimeError("No avaliable Embedding Models")
+
+    if EMBEDDING_MODEL not in available_embed_models:
+        logging.warning(f"Default model {EMBEDDING_MODEL} not in available list. Using first available: {available_embed_models[0]}")
+        EMBEDDING_MODEL = available_embed_models[0]
+
+    if not available_ai_models:
+        raise RuntimeError("No available AI models for content generation.")
+
+    if AI_MODEL not in available_ai_models:
+        logging.warning(f"Default model {AI_MODEL} not in available list. Using first available: {available_ai_models[0]}")
+        AI_MODEL = available_ai_models[0]
+
+    return available_ai_models, available_embed_models, AI_MODEL, EMBEDDING_MODEL
+
+
 async def get_gemini_analysis_and_vector(
     file_resource: Union[types.File, dict], uploaded_mime_type: str, is_sprite_sheet: bool = False
 ):
-    caption, tags, contents = await get_gemini_analysis_with_retries(file_resource, uploaded_mime_type, is_sprite_sheet)
-    vector_embedding = await get_embedding_with_retries(contents)
+    global AI_MODEL
+    global EMBEDDING_MODEL
+
+    available_ai_models, available_embed_models, AI_MODEL, EMBEDDING_MODEL = await get_current_models()
+
+    caption, tags, objects = await get_gemini_analysis_with_retries(
+        file_resource, uploaded_mime_type, is_sprite_sheet, available_ai_models=available_ai_models
+    )
+    vector_embedding = await get_embedding_with_retries(
+        [caption] + tags + [obj.label for obj in objects], available_embed_models=available_embed_models
+    )
     return caption, tags, vector_embedding
 
 
@@ -914,15 +963,19 @@ async def index_image(session: AsyncSession, image_path, user_id):
             user_id=user_id,
             ai_caption=caption,
         )
-        session.add(new_image)
-        await session.flush()  # Flush to get new_image.image_id
+
+        with session.no_autoflush:
+            session.add(new_image)
+            await session.flush()
 
         new_vector = FeatureVector(
             image=new_image,
             model_version=EMBEDDING_MODEL,
             vector_embedding=vector_embedding,
         )
-        session.add(new_vector)
+        with session.no_autoflush:
+            session.add(new_vector)
+            await session.flush()
 
         # Truncate tag name to fit column
         tag_name = caption[:97] + "..." if len(caption) > 100 else caption
@@ -932,10 +985,12 @@ async def index_image(session: AsyncSession, image_path, user_id):
 
         if not caption_tag:
             caption_tag = Tag(tag_name=tag_name, tag_category="AI_Caption")
-            session.add(caption_tag)
-            await session.flush()
+            with session.no_autoflush:
+                session.add(caption_tag)
+                await session.flush()
 
         caption_xref = ImageTagXref(image=new_image, tag=caption_tag, confidence=1.0)
+
         session.add(caption_xref)
 
         for tag_name_raw in ai_tags:
@@ -946,8 +1001,9 @@ async def index_image(session: AsyncSession, image_path, user_id):
 
             if not keyword_tag:
                 keyword_tag = Tag(tag_name=tag_name, tag_category="AI_Keyword")
-                session.add(keyword_tag)
-                await session.flush()
+                with session.no_autoflush:
+                    session.add(keyword_tag)
+                    await session.flush()
 
             keyword_xref = ImageTagXref(image=new_image, tag=keyword_tag, confidence=0.9)
             session.add(keyword_xref)
@@ -1124,10 +1180,13 @@ async def embed_text_query(query, task_type: str = "SEMANTIC_SIMILARITY"):
         vector_response = await client.aio.models.embed_content(
             model=EMBEDDING_MODEL,
             contents=[query],
-            config=types.EmbedContentConfig(task_type=task_type),
+            config=types.EmbedContentConfig(task_type=task_type, output_dimensionality=768),
         )
 
-        query_vector = vector_response.embedding.values
+        if not vector_response.embeddings:
+            logging.error(f"[Embed Utility] ERROR: Could not generate embedding for query: {query}")
+            return None
+        query_vector = vector_response.embeddings[0].values
 
         logging.info(f"[Embed Utility] Query vector generated (Dim: {len(query_vector)}).")
         return query_vector
