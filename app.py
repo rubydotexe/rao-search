@@ -556,12 +556,6 @@ async def get_gemini_analysis_with_retries(
     global AI_MODEL
 
     # available_ai_models, _ = await get_available_ai_models()
-    # if not available_ai_models:
-    #     raise RuntimeError("No available AI models for content generation.")
-
-    # if AI_MODEL not in available_ai_models:
-    #     logging.warning(f"Default model {AI_MODEL} not in available list. Using first available: {available_ai_models[0]}")
-    #     AI_MODEL = available_ai_models[0]
 
     current_model_index = available_ai_models.index(AI_MODEL)
 
@@ -624,12 +618,6 @@ async def get_embedding_with_retries(contents, max_retries: int = 3, backoff_fac
     global EMBEDDING_MODEL
 
     # _, available_embed_models = await get_available_ai_models()
-    # if not available_embed_models:
-    #     raise RuntimeError("No avaliable Embedding Models")
-
-    # if EMBEDDING_MODEL not in available_embed_models:
-    #     logging.warning(f"Default model {EMBEDDING_MODEL} not in available list. Using first available: {available_embed_models[0]}")
-    #     EMBEDDING_MODEL = available_embed_models[0]
 
     current_embed_index = available_embed_models.index(EMBEDDING_MODEL)
 
@@ -885,9 +873,6 @@ async def index_image(session: AsyncSession, image_path, user_id):
 
     # CHECK IF IMAGE ALREADY EXISTS ---
     # existing = await session.execute(select(Image).filter_by(filename=image_path.name))
-    # if existing.scalar_one_or_none():
-    # logging.info(f"[Indexing] SKIPPED: {image_path.name} (already indexed)")
-    # return
 
     file_resource = None  # Can be types.File or dict
     temp_image_path = None
@@ -1166,7 +1151,7 @@ async def run_indexing_async(Session: async_sessionmaker, user_id, image_paths_t
 
         return await asyncio.gather(*tasks)
     except Exception as e:
-        logging.error(f"\n[Indexing] FATAL ERROR during concurrent run: {e}")
+        logging.error(f"[Indexing] FATAL ERROR during concurrent run: {e}")
         return tasks
 
 
@@ -1216,7 +1201,7 @@ async def find_and_delete_incomplete_entries(Session: async_sessionmaker):
 
 
 async def embed_text_query(query, task_type: str = "SEMANTIC_SIMILARITY"):
-    logging.info(f"\n[Embed Utility] Generating vector for text query: '{query[:30]}...' (Type: {task_type})")
+    logging.info(f"[Embed Utility] Generating vector for text query: '{query[:30]}...' (Type: {task_type})")
 
     try:
         vector_response = await client.aio.models.embed_content(
@@ -1441,7 +1426,7 @@ async def main():
 
     search_results_cached = await find_similar_images(Session, search_query, limit=3)
     if search_results_cached:
-        logging.info(f"\n[Cached Search Results for '{search_query}']")
+        logging.info(f"[Cached Search Results for '{search_query[:5].strip()}']")
         logging.debug("(This should have been faster and not logged a 'Fallback' message in embed_text_query)")
     else:
         logging.fino("\nNo search results found.")
