@@ -9,6 +9,7 @@ from google.oauth2.credentials import Credentials
 from google import genai
 from google.genai import types, errors
 from google.genai.types import Part
+import httpx
 from sqlalchemy import (
     UniqueConstraint,
     Column,
@@ -38,6 +39,7 @@ from json import JSONDecodeError
 import json
 from typing import Optional, Union
 import colorlog
+from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -57,26 +59,26 @@ LOCATION = os.getenv("LOCATION", "us-central1")
 DB_URL = os.getenv("DB_URL", "sqlite+pysqlite://data.db")
 VECTOR_DIMENSION = 768
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".gif"}
-EMBEDDING_MODEL = "text-embedding-004"
-AI_MODEL = "gemini-2.5-flash"
+EMBEDDING_MODEL = "embedding-001"
+AI_MODEL = "gemini-2.5-flash-lite"
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TEMP_DIRECTORY = os.getenv("TEMP_DIRECTORY", "temp")
 NO_BROWSER = os.getenv("NO_BROWSER", False)
-SEMAPHORE_LIMIT = os.getenv("SEMAPHORE_LIMIT", 3)
-INDEX_TASK_DELAY = os.getenv("INDEX_TASK_DELAY", 3)
-CRED_TYPE = None
-AUTH_MODE = "OAUTH"
+SEMAPHORE_LIMIT = os.getenv("SEMAPHORE_LIMIT", 1)
+INDEX_TASK_DELAY = os.getenv("INDEX_TASK_DELAY", 32)
+CRED_TYPE = "API"
 NO_RETRY_DELAY = os.getenv("NO_RETRY_DELAY", 0)
 
 os.makedirs("logs", exist_ok=True)
 
+central_tz = ZoneInfo("America/Chicago")
 now = datetime.now()
-log_file_name = f"app_{now.strftime('%Y-%m-%d_%H-%M-%S')}.log"
+log_file_name = f"app_{now.strftime('%Y-%m-%d_%X')}.log"
 log_file_path = Path("logs") / log_file_name
 
 # Get the root logger
 logger = colorlog.getLogger()
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 # Create a colorized formatter
 formatter = colorlog.ColoredFormatter(
@@ -103,6 +105,9 @@ file_handler = logging.FileHandler(log_file_path)
 file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M")
 file_handler.setFormatter(file_formatter)
 
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # Add handlers to the logger
 logger.addHandler(stream_handler)
 logger.addHandler(file_handler)
@@ -123,38 +128,30 @@ def load_creds():
     else:
         logging.warning(f"Token file unavaliable at {token_path}")
 
-    if (
-        not creds
-        or not creds.valid
-        or getattr(creds, "token_state", None) == "INVALID"
-        or creds.token_state == TokenState.INVALID
-    ):
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES, redirect_uri=REDIRECT_URI)
+
+    if not creds or creds.token_state == (TokenState.INVALID or TokenState.STALE):
+        if NO_BROWSER:
+            auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+            logging.info("Please visit this URL on another device:")
+            logging.info(auth_url)
+
+            code = input("Enter the authorization code here: ")
+            flow.fetch_token(code=code)
+            try:
+                creds = flow.credentials
+            except ValueError as e:
+                logging.error(f"Credential Token Value Error: {e}")
+                sys.exit(0)
+            except Exception as e:
+                logging.error(f"Credential Token Error: {e}")
+                sys.exit(0)
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES, redirect_uri=REDIRECT_URI)
+            creds = flow.run_local_server(open_browser=True)
 
-            if NO_BROWSER:
-                auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
-                logging.info("Please visit this URL on another device:")
-                logging.info(auth_url)
-
-                code = input("Enter the authorization code here: ")
-                flow.fetch_token(code=code)
-                try:
-                    creds = flow.credentials
-                except ValueError as e:
-                    logging.error(f"Credential Token Value Error: {e}")
-                    sys.exit(0)
-                except Exception as e:
-                    logging.error(f"Credential Token Error: {e}")
-                    sys.exit(0)
-            else:
-                creds = flow.run_local_server(open_browser=True)
-
-        # Save token to file after successful auth or refresh
-        with open(token_path, "w") as token_file:
-            token_file.write(creds.to_json())
+    # Save token to file after successful auth or refresh
+    with open(token_path, "w") as token_file:
+        token_file.write(creds.to_json())
 
     return creds
 
@@ -162,7 +159,9 @@ def load_creds():
 def get_gemini_client():
     creds = None
 
-    if AUTH_MODE == "OUTH":
+    global CRED_TYPE
+
+    if CRED_TYPE == "OAUTH":
         if CLIENT_SECRETS_FILE:
             try:
                 creds = load_creds()
@@ -174,7 +173,7 @@ def get_gemini_client():
                 logging.error(f"OAuth Configuration failed: {e}")
                 sys.exit(0)
 
-    elif GOOGLE_API_KEY or AUTH_MODE == "API":
+    elif GOOGLE_API_KEY or CRED_TYPE == "API":
         try:
             client = genai.Client(api_key=str(GOOGLE_API_KEY))
             logging.info("Client initialized using GOOGLE_API_KEY for Google AI SDK (supporting file upload).")
@@ -194,7 +193,6 @@ def get_gemini_client():
 
 
 client, CRED_TYPE = get_gemini_client()
-logging.info(f"Using this Auth Type: {CRED_TYPE}")
 
 # Define the declarative base for all models
 Base = declarative_base()
@@ -202,21 +200,40 @@ Base = declarative_base()
 # class GeminiModelManager:
 
 
-async def get_available_models():
+async def get_available_ai_models():
+    global client
+
     """Gets a sorted list of available models that support content generation."""
-    supported_models = []
+    ai_models = []
+    embed_models = []
+
+    model_list = await client.aio.models.list()
+
     try:
-        model_list = await client.aio.models.list()
         for model in model_list:
-            if "generateContent" in model.supported_actions and "createCachedContent" in model.supported_actions:
+            if model.supported_actions and "embedContent" in model.supported_actions:
+                embed_name = model.name.replace("models/", "")
+                embed_models.append(embed_name)
+
+            if (
+                model.supported_actions
+                and "generateContent" in model.supported_actions
+                and "createCachedContent" in model.supported_actions
+            ):
                 model_name = model.name.replace("models/", "")
-                if model_name not in supported_models:
-                    supported_models.append(model_name)
+                ai_models.append(model_name)
+
     except Exception as e:
-        logging.error(f"Could not retrieve model list: {e}")
-    supported_models.sort(reverse=True)
-    # logging.info(f"Avaliable models: {supported_models}")
-    return supported_models
+        logging.critical(f"Could not retrieve model list: {e}")
+        sys.exit(0)
+
+    embed_models.sort(reverse=True)
+    ai_models.sort(reverse=True)
+
+    logging.debug(f"{embed_models}")
+    logging.debug(f"{ai_models}")
+
+    return ai_models, embed_models
 
 
 # 0. New Table: Users ---
@@ -347,6 +364,8 @@ class FeatureVector(Base):
 
 
 async def upload_file(image_path, mime_type: str):
+    global CRED_TYPE
+
     logging.info(f"Calling SDK Upload: {image_path.name} (MIME: {mime_type})")
     if CRED_TYPE == "API":
         try:
@@ -377,6 +396,8 @@ async def upload_file(image_path, mime_type: str):
 
 
 async def delete_file(file_name):
+    global CRED_TYPE
+
     logging.info(f"Calling SDK Delete: {file_name}")
     if CRED_TYPE == "API":
         try:
@@ -480,145 +501,6 @@ async def convert_gif_to_sprite_sheet(gif_path, temp_path, num_frames=5):
         return None
 
 
-async def get_gemini_analysis_and_vector(
-    file_resource: Union[types.File, dict], uploaded_mime_type: str, is_sprite_sheet: bool = False
-):
-
-    file_name_for_logging = file_resource["file_name"] if isinstance(file_resource, dict) else file_resource.name
-    logging.info(f"Calling SDK GenerateContent for file: {file_name_for_logging}")
-
-    caption = None
-    tags = []
-    vector_embedding = None
-    response = None
-
-    try:
-        if is_sprite_sheet:
-            prompt_text = "Analyze this image, which is a sprite sheet of 5 frames from a GIF"
-            "laid out horizontally from left to right. Describe the full action or "
-            "animation from start to finish, then provide the requested structured data."
-            "Do not include the phrase sprite sheet in your description."
-        else:
-            prompt_text = "Analyze the image and provide the requested structured data."
-
-        if CRED_TYPE == "API":
-            contents = [Part.from_text(text=prompt_text), file_resource]
-        elif isinstance(file_resource, dict):
-            # This is the OAUTH case
-            contents = [
-                Part.from_text(text=prompt_text),
-                Part.from_bytes(data=file_resource["bytes"], mime_type=uploaded_mime_type),
-            ]
-            # *** FIX: Removed 'return contents' bug and unnecessary try/except ***
-        else:
-            logging.critical(f"Invalid file_resource type: {type(file_resource)}. Exiting...")
-            sys.exit(0)
-
-        safety_settings = [
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold=types.HarmBlockThreshold.OFF,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold=types.HarmBlockThreshold.OFF,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold=types.HarmBlockThreshold.OFF,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold=types.HarmBlockThreshold.OFF,
-            ),
-            # *** FIX: Removed invalid 'HARM_CATEGORY_CIVIC_INTEGRITY' ***
-        ]
-
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_json_schema=ImageAnalysis.model_json_schema(),
-            thinking_config=types.ThinkingConfig(include_thoughts=False),
-            should_return_http_response=False,
-            safety_settings=safety_settings,
-        )
-
-        response = await client.aio.models.generate_content(model=AI_MODEL, contents=contents, config=config)
-
-        # *** FIX: Added robust JSON parsing and validation *** ---
-        if not response or not response.text:
-            logging.error("Empty response.text from Gemini")
-            logging.error(f"Full response object from Gemini: {response}")
-            # This is a permanent failure, do not retry
-            raise PermanentAnalysisError("Gemini AI model returned empty response.text")
-
-        try:
-            resp_json = json.loads(response.text)
-
-            # Defensive check for blocking or empty content returned by model
-            if "prompt_feedback" in resp_json and resp_json["prompt_feedback"][
-                "GenerateContentResponsePromptFeedback"
-            ].get("block_reason"):
-                block_reason = resp_json["prompt_feedback"]["block_reason"]
-                logging.error(f"Model blocked request with reason: {block_reason}")
-                raise PermanentAnalysisError(f"Gemini AI model blocked request: {block_reason}")
-
-            # Defensive check: ensure expected keys exist to avoid parse errors
-            if not resp_json.get("caption") or not resp_json.get("tags"):
-                logging.error("Response missing required keys 'caption' or 'tags'. Treating as empty.")
-                raise PermanentAnalysisError("Gemini AI model returned incomplete response")
-
-            # Parse analysis object from JSON using Pydantic
-            analysis_object = ImageAnalysis.model_validate_json(response.text)
-            caption = analysis_object.caption
-            tags = analysis_object.tags
-
-        except (ValidationError, JSONDecodeError) as e:
-            logging.error(f"Failed to parse model's JSON response: {e}")
-            if response and hasattr(response, "text"):
-                logging.error(f"Raw Model Response: {response.text}")
-            # This is also a permanent failure
-            raise PermanentAnalysisError(f"Failed to parse model's JSON response: {e}")
-        # End of parsing block ---
-
-        logging.info(f"Analysis Success: {caption[:30].strip()}...")
-
-    except genai.errors.ClientError as e:
-        logging.error(f"[Client Error]: SDK Combined Analysis FAILED for {file_name_for_logging}")
-        if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
-            try:
-                error_body = json.loads(e.response.text)
-                error_code = error_body.get("error", {}).get("code")
-                error_status = error_body.get("error", {}).get("status")
-                logging.error(f"API Error Body: [{error_code}] Status: {error_status}")
-            except json.JSONDecodeError:
-                logging.error(f"API Error Body: Could not parse JSON: {e.response.text}")
-        raise  # Re-raise transient ClientErrors to be caught by the retry wrapper
-
-    except Exception as e:
-        # Catch our own PermanentAnalysisError and other unexpected errors
-        if not isinstance(e, PermanentAnalysisError):
-            logging.error(f"SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
-        raise  # Re-raise all errors
-
-    # Generate embeddings for the caption (if analysis succeeded)
-    try:
-        logging.info("Generating Embeddings...")
-        vector_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL, contents=[caption])
-        if vector_response.embeddings:
-            # The response contains a list of embeddings. Get the values from the first one.
-            vector_embedding = vector_response.embeddings[0].values
-            logging.info("Embedding Success")
-        else:
-            raise PermanentAnalysisError("EmbedContentResponse returned no embeddings.")
-
-        return caption, tags, vector_embedding
-
-    except Exception as e:
-        if not isinstance(e, PermanentAnalysisError):
-            logging.error(f"SDK Embedding FAILED: {e}")
-        raise  # Re-raise all errors
-
-
 def _parse_retry_delay(e: genai.errors.ClientError) -> Optional[float]:
     """
     Parses the 'retryDelay' from a Google API ClientError response.
@@ -652,7 +534,7 @@ def _parse_retry_delay(e: genai.errors.ClientError) -> Optional[float]:
     return None
 
 
-async def get_gemini_analysis_and_vector_with_retries(
+async def get_gemini_analysis_with_retries(
     file_resource: Union[types.File, dict],
     uploaded_mime_type: str,
     is_sprite_sheet: bool = False,
@@ -660,30 +542,35 @@ async def get_gemini_analysis_and_vector_with_retries(
     backoff_factor: float = 2.0,
 ):
     global AI_MODEL
-    available_models = await get_available_models()
-    if not available_models:
-        raise RuntimeError("No available models for content generation.")
 
-    if AI_MODEL not in available_models:
-        logging.warning(f"Default model {AI_MODEL} not in available list. Using first available: {available_models[0]}")
-        AI_MODEL = available_models[0]
+    available_ai_models, _ = await get_available_ai_models()
+    if not available_ai_models:
+        raise RuntimeError("No available AI models for content generation.")
 
-    current_model_index = available_models.index(AI_MODEL)
+    if AI_MODEL not in available_ai_models:
+        logging.warning(f"Default model {AI_MODEL} not in available list. Using first available: {available_ai_models[0]}")
+        AI_MODEL = available_ai_models[0]
+
+    current_model_index = available_ai_models.index(AI_MODEL)
 
     file_name_for_logging = file_resource["file_name"] if isinstance(file_resource, dict) else file_resource.name
 
-    while current_model_index < len(available_models):
-        AI_MODEL = available_models[current_model_index]
-        logging.info(f"Using model: {AI_MODEL}")
+    while current_model_index < len(available_ai_models):
+        AI_MODEL = available_ai_models[current_model_index]
+        logging.info(f"Using AI model: {AI_MODEL}")
 
         attempt = 0
         while attempt < max_retries:
             try:
-                return await get_gemini_analysis_and_vector(file_resource, uploaded_mime_type, is_sprite_sheet)
+                # This function will be created later
+                return await get_gemini_analysis(file_resource, uploaded_mime_type, is_sprite_sheet)
 
             except PermanentAnalysisError as e:
-                logging.critical(f"Permanent failure for {file_name_for_logging}: {e}. No retries will be attempted.")
-                raise e
+                logging.critical(
+                    f"Permanent failure for {file_name_for_logging} with model {AI_MODEL}: {e}. No retries will be attempted with this model."
+                )
+                # Break the inner retry loop and move to the next AI model
+                break
 
             except Exception as e:
                 logging.warning(f"Attempt {attempt + 1} for model {AI_MODEL} failed for {file_name_for_logging}.")
@@ -716,12 +603,230 @@ async def get_gemini_analysis_and_vector_with_retries(
                         logging.info(f"Sleeping {sleep_time:.2f} seconds before retry...")
                     await asyncio.sleep(sleep_time)
 
-        logging.warning(f"All retries failed for model {AI_MODEL}.")
         current_model_index += 1
 
-    raise RuntimeError(
-        f"Failed to get valid Gemini analysis for {file_name_for_logging} after trying all available models."
-    )
+    raise RuntimeError(f"Failed to get valid Gemini analysis for {file_name_for_logging} after trying all available models.")
+
+
+async def get_embedding_with_retries(
+    contents,
+    max_retries: int = 3,
+    backoff_factor: float = 2.0,
+):
+    global EMBEDDING_MODEL
+
+    _, available_embed_models = await get_available_ai_models()
+    if not available_embed_models:
+        raise RuntimeError("No avaliable Embedding Models")
+
+    if EMBEDDING_MODEL not in available_embed_models:
+        logging.warning(f"Default model {EMBEDDING_MODEL} not in available list. Using first available: {available_embed_models[0]}")
+        EMBEDDING_MODEL = available_embed_models[0]
+
+    current_embed_index = available_embed_models.index(EMBEDDING_MODEL)
+
+    while current_embed_index < len(available_embed_models):
+        EMBEDDING_MODEL = available_embed_models[current_embed_index]
+        logging.info(f"Using embedding model: {EMBEDDING_MODEL}")
+
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                return await get_embedding(contents)
+
+            except PermanentAnalysisError as e:
+                logging.critical(
+                    f"Permanent failure for with model {EMBEDDING_MODEL}: {e}. No retries will be attempted with this model."
+                )
+                # Break the inner retry loop and move to the next embedding model
+                break
+
+            except Exception as e:
+                logging.warning(f"Attempt {attempt + 1} for model {EMBEDDING_MODEL} failed.")
+
+                sleep_time = 0.0
+                if str(NO_RETRY_DELAY) == "1":
+                    logging.warning("No Retry Delay, doing next attempt immediately.")
+                else:
+                    # Default to exponential backoff
+                    sleep_time = backoff_factor**attempt
+                    if (
+                        isinstance(e, genai.errors.ClientError)
+                        and hasattr(e, "response")
+                        and e.response
+                        and e.response.status_code == 429
+                    ):
+                        logging.warning("[429 Error]: Resource Exhausted. Trying to parse retryDelay...")
+                        parsed_sleep_time = _parse_retry_delay(e)
+                        if parsed_sleep_time is not None:
+                            sleep_time = parsed_sleep_time + 3
+                            logging.warning(f"API requested retry in {sleep_time:.2f}s. Waiting...")
+                        else:
+                            logging.warning("Could not parse retryDelay. Using exponential backoff.")
+                    else:
+                        logging.warning(f"Transient error: {e}. Using exponential backoff.")
+
+                attempt += 1
+                if attempt < max_retries:
+                    if sleep_time > 0:
+                        logging.info(f"Sleeping {sleep_time:.2f} seconds before retry...")
+                    await asyncio.sleep(sleep_time)
+
+        current_embed_index += 1
+
+    raise RuntimeError(f"Failed to get valid embedding after trying all available models.")
+
+
+async def get_gemini_analysis(file_resource: Union[types.File, dict], uploaded_mime_type: str, is_sprite_sheet: bool = False):
+    global CRED_TYPE
+
+    file_name_for_logging = file_resource["file_name"] if isinstance(file_resource, dict) else file_resource.name
+    logging.info(f"Calling SDK GenerateContent for file: {file_name_for_logging}")
+
+    caption = None
+    tags = []
+    response = None
+
+    try:
+        if is_sprite_sheet:
+            prompt_text = "Analyze this image, which is a sprite sheet of 5 frames from a GIF"
+            "laid out horizontally from left to right. Describe the full action or "
+            "animation from start to finish, then provide the requested structured data."
+            "Do not include the phrase sprite sheet in your description."
+        else:
+            prompt_text = "Analyze the image and provide the requested structured data."
+
+        if CRED_TYPE == "API":
+            contents = [Part.from_text(text=prompt_text), file_resource]
+        elif isinstance(file_resource, dict):
+            # This is the OAUTH case
+            contents = [
+                Part.from_text(text=prompt_text),
+                Part.from_bytes(data=file_resource["bytes"], mime_type=uploaded_mime_type),
+            ]
+        else:
+            logging.critical(f"Invalid file_resource type: {type(file_resource)}. Exiting...")
+            sys.exit(0)
+
+        safety_settings = [
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.OFF,
+            ),
+        ]
+
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=ImageAnalysis.model_json_schema(),
+            thinking_config=types.ThinkingConfig(include_thoughts=False),
+            should_return_http_response=False,
+            safety_settings=safety_settings,
+        )
+
+        logging.info("Calling client.aio.models.generate_content...")
+        response = await client.aio.models.generate_content(model=AI_MODEL, contents=contents, config=config)
+        logging.info("Finished calling client.aio.models.generate_content.")
+
+        if not response or not response.text:
+            logging.error("Empty response.text from Gemini")
+            logging.error(f"Full response object from Gemini: {response}")
+            raise PermanentAnalysisError("Gemini AI model returned empty response.text")
+
+        try:
+            resp_json = json.loads(response.text)
+
+            if "prompt_feedback" in resp_json and resp_json["prompt_feedback"]["GenerateContentResponsePromptFeedback"].get(
+                "block_reason"
+            ):
+                block_reason = resp_json["prompt_feedback"]["block_reason"]
+                logging.error(f"Model blocked request with reason: {block_reason}")
+                raise PermanentAnalysisError(f"Gemini AI model blocked request: {block_reason}")
+
+            if not resp_json.get("caption") or not resp_json.get("tags"):
+                logging.error("Response missing required keys 'caption' or 'tags'. Treating as empty.")
+                raise PermanentAnalysisError("Gemini AI model returned incomplete response")
+
+            analysis_object = ImageAnalysis.model_validate_json(response.text)
+            caption = analysis_object.caption
+            tags = analysis_object.tags
+
+        except (ValidationError, JSONDecodeError) as e:
+            logging.error(f"Failed to parse model's JSON response: {e}")
+            if response and hasattr(response, "text"):
+                logging.error(f"Raw Model Response: {response.text}")
+            raise PermanentAnalysisError(f"Failed to parse model's JSON response: {e}")
+
+        logging.info(f"Analysis Success: {caption[:30].strip()}...")
+        return caption, tags, contents
+
+    except genai.errors.ClientError as e:
+        logging.error(f"[Client Error]: SDK Combined Analysis FAILED for {file_name_for_logging}")
+        if hasattr(e, "response") and e.response and hasattr(e.response, "text") and e.response.text:
+            try:
+                error_body = json.loads(e.response.text)
+                error_code = error_body.get("error", {}).get("code")
+                error_status = error_body.get("error", {}).get("status")
+                logging.error(f"API Error Body: [{error_code}] Status: {error_status}")
+            except json.JSONDecodeError:
+                logging.error(f"API Error Body: Could not parse JSON: {e.response.text}")
+        raise
+
+    except Exception as e:
+        if not isinstance(e, PermanentAnalysisError):
+            logging.error(f"SDK Combined Analysis FAILED for {file_name_for_logging}: {e}")
+        raise
+
+
+async def get_embedding(contents):
+    try:
+        logging.info("Generating Embeddings...")
+        vector_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL, contents=contents)
+        if vector_response.embeddings:
+            vector_embedding = vector_response.embeddings[0].values
+            logging.info("Embedding Success")
+            return vector_embedding
+        else:
+            raise PermanentAnalysisError("EmbedContentResponse returned no embeddings.")
+
+    except Exception as e:
+        if not isinstance(e, PermanentAnalysisError):
+            error_body = json.loads(e.response.text)
+            error_code = error_body.get("error", {}).get("code")
+            error_status = error_body.get("error", {}).get("status")
+
+            logging.error(f"SDK Embedding FAILED: [{error_code}] Status: {error_status}")
+
+        raise
+
+
+async def get_gemini_analysis_and_vector(
+    file_resource: Union[types.File, dict], uploaded_mime_type: str, is_sprite_sheet: bool = False
+):
+    caption, tags, contents = await get_gemini_analysis_with_retries(file_resource, uploaded_mime_type, is_sprite_sheet)
+    vector_embedding = await get_embedding_with_retries(contents)
+    return caption, tags, vector_embedding
+
+
+async def get_gemini_analysis_and_vector_with_retries(
+    file_resource: Union[types.File, dict],
+    uploaded_mime_type: str,
+    is_sprite_sheet: bool = False,
+    max_retries: int = 3,
+    backoff_factor: float = 2.0,
+):
+    return await get_gemini_analysis_and_vector(file_resource, uploaded_mime_type, is_sprite_sheet)
 
 
 async def index_image(session: AsyncSession, image_path, user_id):
@@ -935,6 +1040,10 @@ async def run_indexing_async(Session: async_sessionmaker, user_id, image_paths_t
                 try:
                     await index_image(session, path, user_id)
                     await session.commit()
+                except asyncio.CancelledError:
+                    logging.info(f"Task for {path.name} was cancelled.")
+                    await session.rollback()
+                    raise
                 except Exception as e:
                     # This message is now correct
                     logging.error(f"[Indexing] FAILED/ROLLED BACK: {path.name}. Error: {e}")
@@ -949,18 +1058,18 @@ async def run_indexing_async(Session: async_sessionmaker, user_id, image_paths_t
 
     # THIS BLOCK RUNS THE TASKS ---
     # It must be indented inside run_indexing_async, NOT controlled_index_task
+    tasks = []
     try:
         logging.info(f"[Concurrency] Limiting concurrent indexing tasks to {SEMAPHORE_LIMIT}.")
         num_tasks = len(image_paths_to_index)
-        tasks = []
         for i, path in enumerate(image_paths_to_index):
             is_last = i == num_tasks - 1
             tasks.append(controlled_index_task(path, user_id, is_last=is_last))
 
-        await asyncio.gather(*tasks)
-        logging.info("\n[Indexing] All concurrent tasks completed")
+        return await asyncio.gather(*tasks)
     except Exception as e:
         logging.error(f"\n[Indexing] FATAL ERROR during concurrent run: {e}")
+        return tasks
 
 
 async def find_and_delete_incomplete_entries(Session: async_sessionmaker):
@@ -992,9 +1101,7 @@ async def find_and_delete_incomplete_entries(Session: async_sessionmaker):
         if not incomplete_images:
             return []
 
-        logging.info(
-            f"[Scanning] Found {len(incomplete_images)} incomplete entries. They will be deleted and re-indexed."
-        )
+        logging.info(f"[Scanning] Found {len(incomplete_images)} incomplete entries. They will be deleted and re-indexed.")
 
         for image in incomplete_images:
             image_path = Path(image.local_file_path)
@@ -1002,9 +1109,7 @@ async def find_and_delete_incomplete_entries(Session: async_sessionmaker):
                 paths_to_rescan.append(image_path)
                 await session.delete(image)
             else:
-                logging.warning(
-                    f"[Scanning] Incomplete entry found, but file is missing: {image.local_file_path}. Deleting from DB."
-                )
+                logging.warning(f"[Scanning] Incomplete entry found, but file is missing: {image.local_file_path}. Deleting from DB.")
                 await session.delete(image)
 
         await session.commit()
@@ -1135,6 +1240,25 @@ async def initialize_database(db_url):
     return engine, Session
 
 
+async def temp_dir_cleanup():
+    global TEMP_DIRECTORY
+
+    dir_path = Path(TEMP_DIRECTORY)
+
+    if not dir_path.is_dir():
+        logging.error(f"Error: Directory not found at {dir_path}")
+    else:
+        for item in dir_path.iterdir():
+            if item.is_file():
+                try:
+                    item.unlink()
+                    logging.debug(f"Deleted file: {item.name}")
+                except OSError as e:
+                    logging.debug(f"Error deleting {item.name}: {e}")
+
+    logging.info("Finished deleting files.")
+
+
 async def main():
     """Main asynchronous function to run the script."""
     os.makedirs(Path(TEMP_DIRECTORY), exist_ok=True)
@@ -1177,11 +1301,17 @@ async def main():
                 logging.error(f"Failed to create or find mock user: {e}")
                 await setup_session.rollback()
                 sys.exit(1)
+        tasks = None
         try:
             logging.info(f"[Indexing] Starting to index {len(final_paths_to_index)} new and/or incomplete images...")
-            await run_indexing_async(Session, mock_user.user_id, final_paths_to_index)
+            tasks = await run_indexing_async(Session, mock_user.user_id, final_paths_to_index)
         except KeyboardInterrupt:
             logging.info("Indexing interrupted by user.")
+            if tasks:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await temp_dir_cleanup()
             sys.exit(0)
     else:
         logging.info("[Indexing] No new or incomplete images to index.")
@@ -1190,7 +1320,7 @@ async def main():
     logging.info("PERFORMING SEMANTIC SEARCH TEST")
     print("=" * 50)
 
-    search_query = "Anything Dog related"
+    search_query = "Anything featuring a woman"
 
     search_results = await find_similar_images(Session, search_query, limit=3)
 
@@ -1225,5 +1355,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("\nScript terminated by user.")
+        logging.debug("Script terminated by user.")
+        # No need to call temp_dir_cleanup() here as it is handled in main()
         sys.exit(0)

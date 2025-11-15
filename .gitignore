@@ -215,6 +215,7 @@ temp
 alembic
 alembic.ini
 __pycache__
+example
 
 # VSCode Workspace
 .vscode
