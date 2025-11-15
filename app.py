@@ -11,6 +11,7 @@ from google.genai import types, errors
 from google.genai.types import Part
 import httpx
 from sqlalchemy import (
+    exc as sqlalchemy_exc,
     UniqueConstraint,
     Column,
     BigInteger,
@@ -1091,29 +1092,70 @@ async def run_indexing_async(Session: async_sessionmaker, user_id, image_paths_t
     # DEFINE THE TASK FUNCTION *INSIDE* ---
     # This lets it access 'sem' and 'Session'
     async def controlled_index_task(path, user_id, is_last=False):
-        async with Session() as session:
-            async with sem:
+
+        # FIX: Define a maximum number of retries
+        max_retries = 2  # Try once, then retry one more time
+
+        # FIX: The semaphore must be acquired *outside* the retry loop
+        # so that a retrying task still holds its "slot".
+        async with sem:
+
+            # FIX: Add a 'for' loop to handle retries
+            for attempt in range(max_retries):
                 try:
-                    await index_image(session, path, user_id)
-                    await session.commit()
+                    # FIX: A new session should be created *inside* the loop
+                    # so that each attempt gets a fresh, clean session.
+                    async with Session() as session:
+                        await index_image(session, path, user_id)
+                        await session.commit()
+
+                    # If we get here, it was successful.
+                    # We log a success *only if* it wasn't the first attempt.
+                    if attempt > 0:
+                        logging.info(f"[Indexing] SUCCESS (on retry {attempt}): {path.name}")
+
+                    break  # <-- Success, break the retry loop
+
                 except asyncio.CancelledError:
                     logging.info(f"Task for {path.name} was cancelled.")
-                    await session.rollback()
-                    raise
-                except Exception as e:
-                    # This message is now correct
-                    logging.error(f"[Indexing] FAILED/ROLLED BACK: {path.name}. Error: {e}")
-                    await session.rollback()
-                finally:
-                    # ADD THIS DELAY ---
-                    # Force a wait to stay under the RPM limit, but not for the last item
-                    if not is_last:
-                        logging.info(f"[Concurrency] Waiting {INDEX_TASK_DELAY}s to respect rate limit...")
-                        # Convert to int in case it's read from .env as str
-                        await asyncio.sleep(int(INDEX_TASK_DELAY))
+                    # No rollback needed, session is closed by 'async with'
+                    raise  # Re-raise to stop processing
 
-    # THIS BLOCK RUNS THE TASKS ---
-    # It must be indented inside run_indexing_async, NOT controlled_index_task
+                # FIX: Specifically catch database errors (like the cache error)
+                except sqlalchemy_exc.DBAPIError as e:
+                    # We check the error string for our *specific* transient error
+                    if "InvalidCachedStatementError" in str(e):
+                        logging.warning(
+                            f"[Indexing] RETRYING: {path.name} (Attempt {attempt + 1}/{max_retries}). Hit InvalidCachedStatementError."
+                        )
+
+                        if attempt + 1 == max_retries:
+                            # If this was the last attempt, log final failure
+                            logging.error(f"[Indexing] FAILED (Final Attempt): {path.name} after cache error. Error: {e}")
+                        else:
+                            await asyncio.sleep(1)  # Wait 1s before retrying
+
+                    else:
+                        # It was a *different* database error (e.g., "table not found")
+                        # This is permanent, so we log and break the retry loop.
+                        logging.error(f"[Indexing] FAILED/ROLLED BACK (DB Error): {path.name}. Error: {e}")
+                        break  # Stop retrying for this file
+
+                except Exception as e:
+                    # This catches non-DB errors (e.g., file read, API failure)
+                    # that were not caught by index_image's own logic.
+                    logging.error(f"[Indexing] FAILED/ROLLED BACK (General Error): {path.name}. Error: {e}")
+                    break  # Stop retrying for this file
+
+            # FIX: This 'finally' logic (the rate-limit delay) is now
+            # moved *outside* the retry loop, but *still inside* the 'async with sem' block.
+            # This ensures we wait *after* an image is fully processed (or failed).
+            if not is_last:
+                logging.info(f"[Concurrency] Waiting {INDEX_TASK_DELAY}s to respect rate limit...")
+                # Convert to int in case it's read from .env as str
+                await asyncio.sleep(int(INDEX_TASK_DELAY))
+
+    # THIS BLOCK RUNS THE TASKS (Unchanged from your original)
     tasks = []
     try:
         logging.info(f"[Concurrency] Limiting concurrent indexing tasks to {SEMAPHORE_LIMIT}.")
@@ -1214,10 +1256,7 @@ async def find_similar_images(Session: async_sessionmaker, query, limit: int = 5
     # Use async session ---
     async with Session() as session:
         try:
-            # Define the distance operation
-            if isinstance(query_vector, list):
-                query_vector = tuple(query_vector)
-            distance = FeatureVector.vector_embedding.op("<->")(query_vector).label("distance")
+            distance = FeatureVector.vector_embedding.l2_distance(query_vector).label("distance")
 
             # Use SQLAlchemy 2.0 select() style ---
             query_stmt = (
@@ -1250,8 +1289,10 @@ async def find_similar_images(Session: async_sessionmaker, query, limit: int = 5
                 logging.error(f"API Error Body: {e.response.text}")
         except errors.APIError as e:
             logging.error(f"[Vector Error] {e.code}: {e.message}")
+        except ValueError as e:
+            logging.critical(f"[Search] FATAL VALUE ERROR: {e[:20]}")
         except Exception as e:
-            logging.error(f"[Search] FATAL ERROR during vector query: {e}")
+            logging.critical(f"[Search] FATAL ERROR during vector query: {e}")
             # No rollback needed on SELECT, session closes automatically
 
     return results
@@ -1391,7 +1432,7 @@ async def main():
             print(f"    - Local Path: {result['local_file_path']}")
             print(f"    - Distance (L2): {result['similarity_distance']:.4f}")
     else:
-        print("\nNo search results found.")
+        logging.info("\nNo search results found.")
 
     # Test caching
     logging.info("\n" + "=" * 50)
@@ -1400,10 +1441,10 @@ async def main():
 
     search_results_cached = await find_similar_images(Session, search_query, limit=3)
     if search_results_cached:
-        print(f"\n[Cached Search Results for '{search_query}']")
-        print("(This should have been faster and not logged a 'Fallback' message in embed_text_query)")
+        logging.info(f"\n[Cached Search Results for '{search_query}']")
+        logging.debug("(This should have been faster and not logged a 'Fallback' message in embed_text_query)")
     else:
-        print("\nNo search results found.")
+        logging.fino("\nNo search results found.")
 
     # Clean up engine resources
     await engine.dispose()
