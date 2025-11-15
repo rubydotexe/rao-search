@@ -484,9 +484,9 @@ class GeminiService:
             prompt = "Analyze the image and provide the requested structured data."
 
         if self.cred_type == "API":
-            contents = [Part.from_text(prompt), file_resource]
+            contents = [Part.from_text(text=prompt), file_resource]
         else:  # OAUTH
-            contents = [Part.from_text(prompt), Part.from_bytes(data=file_resource["bytes"], mime_type=mime_type)]
+            contents = [Part.from_text(text=prompt), Part.from_bytes(data=file_resource["bytes"], mime_type=mime_type)]
 
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -512,8 +512,7 @@ class GeminiService:
         response = await self.client.aio.models.embed_content(
             model=self.embedding_model,
             contents=text_content,
-            task_type=task_type,
-            config=types.EmbedContentConfig(output_dimensionality=settings.VECTOR_DIMENSION),
+            config=types.EmbedContentConfig(output_dimensionality=settings.VECTOR_DIMENSION, task_type=task_type),
         )
         if not response.embeddings:
             raise PermanentAnalysisError("API returned no embeddings.")
