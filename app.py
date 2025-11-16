@@ -1,30 +1,7 @@
-# ruff: noqa: E501
-"""
-This script provides a comprehensive solution for indexing a local image gallery,
-generating descriptive metadata and vector embeddings using the Google Gemini API,
-and performing semantic searches on the indexed data.
-
-**Features:**
-- **Database Backend:** Uses PostgreSQL with the pgvector extension for efficient similarity searches.
-- **ORM:** Leverages SQLAlchemy 2.0 with async support for database interactions.
-- **AI-Powered Indexing:**
-    - Generates rich captions and relevant tags for each image using a Gemini model.
-    - Creates vector embeddings from the generated text for semantic understanding.
-    - Handles various image formats, including automatic sprite sheet conversion for GIFs.
-- **Robust API Interaction:**
-    - Implements an exponential backoff retry mechanism for handling transient API errors.
-    - Supports both API Key and OAuth 2.0 authentication methods.
-    - Intelligently falls back to different AI models if a preferred model fails.
-- **Efficient & Asynchronous:**
-    - Built with asyncio for high-concurrency processing of images.
-    - Uses a semaphore to control concurrent API requests and respect rate limits.
-- **Configuration:** Managed via a Pydantic Settings class, allowing for easy setup through environment variables.
-- **Semantic Search:** Provides a function to find semantically similar images based on a natural language query.
-"""
-
 import asyncio
 import json
 import logging
+from logging import LogRecord
 import sys
 from datetime import datetime
 from functools import wraps
@@ -42,15 +19,8 @@ from google.genai import Client, types, errors
 from google.genai.types import Part
 from pgvector.sqlalchemy import Vector
 from PIL import Image as PILImage
-from pydantic import (
-    BaseModel,
-    Field,
-    ValidationError,
-    FilePath,
-    DirectoryPath,
-    AnyUrl,
-)
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field, ValidationError, FilePath, DirectoryPath, AnyUrl, AliasChoices
+from pydantic_settings import BaseSettings, SettingsConfigDict, CLI_SUPPRESS
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -79,28 +49,35 @@ load_dotenv()
 
 
 class Settings(BaseSettings):
-    """Manages application configuration using Pydantic for validation and type safety."""
+    """rao-search is a Python-based image gallery application that uses the Google Gemini AI to automatically generate captions, tags, and vector embeddings for images. It stores this information in a PostgreSQL database with the `pgvector` extension, allowing for semantic searching of the image library."""
 
     # --- Project & Authentication ---
-    PROJECT_ID: Optional[str] = None
-    LOCATION: str = "us-central1"
+    PROJECT_ID: Optional[str] = Field(
+        default=None,
+        description="Project ID from the Google Cloud project associated with your clients secret file. Mandatory if using OAUTH.",
+    )
+    LOCATION: Optional[str] = Field(default="us-central1", description="Google Cloud project location. Mandatory if using OAUTH.")
     CLIENT_SECRETS_FILE: FilePath = Field(
         default=Path(".secrets/client_secret.json"),
-        description="Path to the Google OAuth client secrets JSON file.",
+        description="Path to the Google OAuth client secrets JSON file. Mandatory if using OAUTH.",
     )
-    TOKEN_DIR: DirectoryPath = Field(
-        default=Path(".secrets"),
-        description="Directory to store the OAuth token file.",
+    TOKEN_DIR: DirectoryPath = Field(default=Path(".secrets"), description="Directory to store the OAuth token file.")
+    REDIRECT_URI: str = Field(default="urn:ietf:wg:oauth:2.0:oob", description=CLI_SUPPRESS)
+    SCOPES: list[str] = Field(
+        default=[
+            "openid",
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+        ],
+        description=CLI_SUPPRESS,
     )
-    REDIRECT_URI: str = "urn:ietf:wg:oauth:2.0:oob"
-    SCOPES: list[str] = [
-        "openid",
-        "https://www.googleapis.com/auth/cloud-platform",
-        "https://www.googleapis.com/auth/userinfo.email",
-        "https://www.googleapis.com/auth/userinfo.profile",
-    ]
-    GOOGLE_API_KEY: Optional[str] = None
-    CRED_TYPE: Literal["API", "OAUTH"] = "API"
+    GOOGLE_API_KEY: Optional[str] = Field(
+        default=None, description="The API key to use for authentication. Applies to the Gemini Developer API only."
+    )
+    CRED_TYPE: Literal["API", "OAUTH"] = Field(
+        default="API", description="The auth type you want to use with Gemini SDK. Will impact how images are uploaded."
+    )
 
     # --- Database ---
     DB_URL: AnyUrl = Field(
@@ -109,48 +86,57 @@ class Settings(BaseSettings):
     )
 
     # --- Gemini AI Models ---
-    AI_MODEL: str = "gemini-2.5-flash"
-    EMBEDDING_MODEL: str = "text-embedding-004"
-    VECTOR_DIMENSION: int = 768
+    AI_MODEL: str = Field(
+        default="gemini-2.5-flash",
+        description="Default Gemini model that will do image analysis.",
+    )
+    EMBEDDING_MODEL: str = Field(default="text-embedding-004", description="Default model for creating embeddings for queries.")
+    VECTOR_DIMENSION: int = Field(default=768, description=CLI_SUPPRESS)
 
     # --- File & Directory Paths ---
-    IMAGE_GALLERY: DirectoryPath = Field(
-        default=Path.home() / "pictures",
-        description="Directory containing images to be indexed.",
-    )
-    TEMP_DIRECTORY: Path = Field(default=Path("temp"), description="Directory for temporary files (e.g., GIF sprites).")
-    LOG_DIR: Path = Field(default=Path("logs"), description="Directory for log files.")
+    IMAGE_GALLERY: DirectoryPath = Field(default=Path.home() / "pictures", description="Directory containing images to be indexed.")
+    TEMP_DIRECTORY: DirectoryPath = Field(default=Path("temp"), description="Directory for temporary files (e.g., GIF sprites).")
+    LOG_DIR: DirectoryPath = Field(default=Path("logs"), description="Directory for log files.")
 
     # --- Indexing & Concurrency ---
-    SEMAPHORE_LIMIT: int = 3
-    INDEX_TASK_DELAY: int = 5
-    NO_BROWSER: bool = False
-    NO_RETRY_DELAY: bool = False
-    MAX_RETRIES: int = 3
-    BACKOFF_FACTOR: float = 2.0
+    SEMAPHORE_LIMIT: int = Field(default=3, description="Manages number of concurrent execution of indexing tasks with a semaphore.")
+    INDEX_TASK_DELAY: int = Field(default=5, description="Duration of seconds between each task.")
+    NO_BROWSER: bool = Field(default=False, description="Set to True if you need to do an OAuth login headless.")
+    NO_RETRY_DELAY: bool = Field(default=False, description="Set to True if you don't want tasks to wait before starting.")
+    MAX_RETRIES: int = Field(default=3, description="Number of times to retry using a model before switching.")
+    BACKOFF_FACTOR: float = Field(default=2.0, description=CLI_SUPPRESS)
 
     # --- File Handling ---
-    IMAGE_EXTENSIONS: set[str] = {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".webp",
-        ".heic",
-        ".heif",
-        ".gif",
-    }
+    IMAGE_EXTENSIONS: set[str] = Field(
+        default={
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+            ".heic",
+            ".heif",
+            ".gif",
+        },
+        description=CLI_SUPPRESS,
+    )
 
     @property
     def TOKEN_FILE(self) -> Path:
         """Constructs the full path to the token file."""
         return self.TOKEN_DIR / "token.json"
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # --- Search ---
+    QUERY: str = Field(
+        default="Show images related to animals.", description="Query for similarity search.", validation_alias=AliasChoices("q")
+    )
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", cli_parse_args=True, cli_prog_name="rao-search"
+    )
 
 
 # Instantiate settings early
 settings = Settings()
-
 
 # ==============================================================================
 # 2. Logging Setup
@@ -178,9 +164,10 @@ def setup_logging():
             "CRITICAL": "red,bg_white",
         },
     )
+
     stream_handler = colorlog.StreamHandler()
     stream_handler.setFormatter(formatter)
-    stream_handler.setLevel(logging.INFO)
+    stream_handler.setLevel(logging.DEBUG)
     logger.addHandler(stream_handler)
 
     # File Handler
@@ -386,6 +373,7 @@ class GeminiService:
         self._model_cache: Optional[tuple[list[str], list[str]]] = None
         self.ai_model = settings.AI_MODEL
         self.embedding_model = settings.EMBEDDING_MODEL
+        self.query = settings.QUERY
 
     def _load_oauth_creds(self) -> Credentials:
         """Handles the OAuth 2.0 authentication flow."""
@@ -396,9 +384,9 @@ class GeminiService:
             except (ValueError, json.JSONDecodeError) as e:
                 logger.warning(f"Could not load token file, will re-authenticate: {e}")
 
-        if not creds or not creds.token_state(TokenState.FRESH):
+        if not creds or not creds.token_state == TokenState.FRESH:
 
-            if creds and creds.token_state(TokenState.INVALID or TokenState.STALE) and creds.refresh_token:
+            if creds and creds.refresh_token:
                 logger.info("Refreshing expired OAuth credentials...")
                 creds.refresh(Request())
             else:
@@ -426,7 +414,7 @@ class GeminiService:
             if cred_type == "OAUTH":
                 logger.info("Initializing Gemini client with OAuth credentials...")
                 creds = self._load_oauth_creds()
-                return Client(credentials=creds, vertexai=True, location=settings.LOCATION, project_id=settings.PROJECT_ID)
+                return Client(credentials=creds, vertexai=True, location=settings.LOCATION, project=settings.PROJECT_ID)
             elif cred_type == "API" and settings.GOOGLE_API_KEY:
                 logger.info("Initializing Gemini client with API Key...")
                 return Client(api_key=settings.GOOGLE_API_KEY)
@@ -451,7 +439,7 @@ class GeminiService:
                 if "generateContent" in model.supported_actions:
                     ai_models.append(name)
         except Exception as e:
-            raise RaoSearchError(f"Could not retrieve model list: {e}")
+            raise RaoSearchError(f"Could not retrieve model list. You might have hit your rate limit or quota: {e}")
 
         ai_models.sort(reverse=True)
         embed_models.sort(reverse=True)
@@ -831,6 +819,7 @@ async def indexing_task_runner(
 
 async def run_search_test(db: DatabaseService, gemini: GeminiService, query: str):
     """Runs a sample search query and prints the results."""
+
     logger.info(f"\n{'='*50}\nPERFORMING SEMANTIC SEARCH TEST\n{'='*50}")
     logger.info(f"Search Query: '{query}'")
 
@@ -877,7 +866,8 @@ async def main():
         logger.info("Image gallery is fully indexed and up to date.")
 
     # --- Search Test ---
-    await run_search_test(db, gemini, "A person smiling")
+    query = gemini.query
+    await run_search_test(db, gemini, query)
 
     # --- Cleanup ---
     await db.dispose()
