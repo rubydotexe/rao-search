@@ -2,8 +2,6 @@
 
 **rao-search** is a Python-based image gallery application that leverages Google Gemini AI to automatically generate captions, tags, and vector embeddings for images. It stores image metadata and embeddings in a PostgreSQL database with the `pgvector` extension, enabling semantic search capabilities on the image library.
 
-***
-
 ## Features
 
 - Automatically indexes images in a specified local directory.
@@ -17,7 +15,6 @@
 - Colorized logging to console and file.
 - Exception handling for robust error management.
 
-***
 
 ## Requirements
 
@@ -26,7 +23,6 @@
 - Google Cloud credentials for Gemini API (OAuth client secrets or API key)
 - Packages as specified in code imports (e.g., `colorlog`, `pydantic`, `sqlalchemy[asyncio]`, `google-auth`, `google-genai`, `pgvector`, `pillow`, `python-dotenv`)
 
-***
 
 ## Installation
 
@@ -40,8 +36,6 @@ pip install -r requirements.txt
 4. Create a `.env` file to configure the environment variables or modify the default values in the `Settings` class.
 5. Place your Google OAuth client secret JSON in `.secrets/client_secret.json` or set the API key in `.env`. You can change your secret and temp directories with cli arguments or your `.env`.
 6. Ensure PostgreSQL is running and accessible with `pgvector` extension installed.
-
-***
 
 ## Configuration
 
@@ -69,7 +63,6 @@ The application is configured via environment variables or CLI, with defaults de
 ### Tip
 See the `.env.sample` for inspiration in your own config. The `Settings class` of the `app.py` will always have the most up to date selection of env and cli parementers. 
 
-***
 
 ## Usage
 
@@ -92,7 +85,6 @@ The application will:
 5. Perform a sample semantic search.
 6. Clean up temporary files.
 
-***
 
 ## Code Structure Overview
 
@@ -158,7 +150,6 @@ The application will:
 - Performs semantic search test and logs results.
 - Graceful shutdown with error handling.
 
-***
 
 ## Notes
 
@@ -169,7 +160,6 @@ The application will:
 - Supports semantic similarity search using vector L2 distance.
 - Free Tier, and therefore `OAUTH` will likely reach its rate limit and quota frequently. Consider a paid tier if needed. See [Gemini documentation](https://ai.google.dev/gemini-api/docs/rate-limits) for latest rate limit information.
 
-***
 
 ## Example
 
@@ -209,8 +199,6 @@ PERFORMING SEMANTIC SEARCH TEST
 
 ```
 
-
-***
 ## TODOS
 - Investigate if I can somehow use OAUTH to allow the Gemini SDK to read directly from Google Drive/Photos
 - Possibly adapt this script to allow generation from other models (maybe using OpenAI adapters)
